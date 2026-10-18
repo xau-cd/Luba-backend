@@ -1,0 +1,12 @@
+# Dépendances Python FACULTATIVES de Luba Engine (le worker fonctionne avec la seule bibliothèque standard :
+# ZIP, texte/code, JSON, XML, HTML, CSS, CSV, Python (ast), PNG/JPEG (dimensions)).
+# Chaque paquet ci-dessous active un format supplémentaire ; s'il manque, le moteur le DIT (GET /api/engine/capabilities)
+# au lieu de prétendre le prendre en charge.
+openpyxl>=3.1      # XLSX (aperçu des feuilles, lecture seule)
+python-docx>=1.1   # DOCX (texte, tableaux)
+pypdf>=4.0         # PDF (texte extractible ; pas d'OCR)
+Pillow>=10.0       # images : validation + dimensions de PNG/JPEG/GIF/WebP
+PyYAML>=6.0        # YAML (safe_load)
+pyflakes>=3.2      # analyse statique Python supplémentaire (avertissements)
+# Non utilisés par la version actuelle (listés dans le cahier des charges, volontairement NON ajoutés pour ménager Render Free) :
+# pandas, beautifulsoup4, lxml

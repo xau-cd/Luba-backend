@@ -9,7 +9,7 @@
 |---|---|
 | `luba-engine.js` | Moteur Node (pipeline, sécurité, outils, routes HTTP). Aucune dépendance npm nouvelle. |
 | `luba_worker.py` | Worker Python (protocole JSON v1) : ZIP, analyse de fichiers, contrôles syntaxiques, diff, archives. |
-| `index.js` | Ton `index.js` v18 + **31 lignes ajoutées + 2 lignes d’origine étendues** (repère : `[LUBA ENGINE]`). Voir `CHANGES_INDEX.md`. |
+| `index.js` | Ton `index.js` v18 + **35 lignes ajoutées** (repère : `[LUBA ENGINE]`). Voir `CHANGES_INDEX.md`. |
 | `index.original.js` | Sauvegarde exacte de ton `index.js` d'origine (restauration : la renommer en `index.js`). |
 | `requirements.txt` | Paquets Python **facultatifs** (chacun active un format). |
 | `.env.engine.example` | Variables `ENGINE_*` (aucun secret). |
@@ -92,3 +92,15 @@ Le moteur dégrade proprement : sans Python/g++, il le dit et ne fait que ce qui
 ## 7. Tests
 
 `node --test --test-force-exit "test/*.test.js"` — aucun réseau ni clé requis. Les tests dépendant d'un outil absent sont **ignorés avec leur raison**, jamais comptés comme réussis. Voir `RAPPORT_VALIDATION.md`.
+
+
+---
+## 8. Mise à jour de l'audit de fiabilisation (octobre 2026)
+
+Remplace/complète les §3 et §5 ci-dessus :
+
+* **Permissions** : l'exécution de code exige `ENGINE_ALLOW_EXEC=true` **et** un rôle de `ENGINE_EXEC_ROLES` (défaut `ADMIN`) **et** une isolation (bwrap, ou service distant authentifié). Le rôle est revérifié à chaque appel d'outil (`ctx.role`).
+* **`engine_run_code`** n'est annoncé au LLM que si `ENGINE_EXPOSE_RUN_TOOL=true` en plus. Par défaut : jamais.
+* **Chaque outil** valide ses arguments contre son schéma (type, requis, énumération, longueur, arguments inconnus refusés), a un délai maximal (`ENGINE_TOOL_TIMEOUT_MS`) et renvoie `meta: { tool, durationMs, permissions, timeoutMs }`.
+* **Capacités** (`GET /api/engine/capabilities`) distinguent *détecté* / *testé* (un programme trivial est réellement compilé au démarrage) / *autorisé pour vous*. Un administrateur voit aussi `isolation.probe` : la **raison** de chaque échec d'isolation.
+* **Exécution distante** : voir `PROTOCOLE_EXECUTION_DISTANTE.md`. Le client est livré et testé ; **le service isolé lui-même n'est pas fourni**.

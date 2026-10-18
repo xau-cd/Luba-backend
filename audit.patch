@@ -1,0 +1,536 @@
+diff --git a/.github/workflows/fix.yml b/.github/workflows/fix.yml
+index 2f62f3c..25eda03 100644
+--- a/.github/workflows/fix.yml
++++ b/.github/workflows/fix.yml
+@@ -1,8 +1,9 @@
+ name: Auto-fix variable calls
+ 
++# [audit] DÉCLENCHEMENT MANUEL UNIQUEMENT. Avant : exécuté à chaque push sur main, il réécrivait index.js puis le poussait.
++# Le sed `metrics()` transformait `await metrics.registry.metrics()` (méthode légitime de prom-client) en `metrics.registry.metrics`
++# → endpoint /metrics cassé, que `node --check` ne détecte pas. Ces corrections visaient l'ancien module v16.5 (déjà corrigé à la source).
+ on:
+-  push:
+-    branches: [main]
+   workflow_dispatch:
+ 
+ permissions:
+@@ -19,7 +20,6 @@ jobs:
+           cp index.js index.js.bak
+           sed -i 's/\bfirebaseApp()/firebaseApp/g' index.js
+           sed -i 's/\bredisClient()/redisClient/g' index.js
+-          sed -i 's/\bmetrics()/metrics/g' index.js
+           if node --check index.js; then
+             rm index.js.bak
+             echo "✅ Syntaxe OK"
+diff --git a/index.js b/index.js
+index 91d31ba..bc7a53c 100644
+--- a/index.js
++++ b/index.js
+@@ -434,6 +434,7 @@ const CONFIG = deepFreeze({
+     WINDOW: envInt("HEALTH_WINDOW", 20),
+     MIN_SAMPLES: envInt("HEALTH_MIN_SAMPLES", 6),
+     OPEN_FAIL_RATE: envFloat("HEALTH_OPEN_FAIL_RATE", 0.7),
++    SAMPLE_TTL_MS: envInt("HEALTH_SAMPLE_TTL_MS", 120000),   // [FIX audit] péremption des échantillons par le TEMPS (avant : par nombre seulement)
+     COOLDOWN_MS: envInt("HEALTH_COOLDOWN_MS", 20000),
+     MAX_COOLDOWN_MS: envInt("HEALTH_MAX_COOLDOWN_MS", 120000),
+     KEY_COOLDOWN_MS: envInt("KEY_COOLDOWN_MS", 15000),
+@@ -1501,6 +1502,10 @@ function initFirebase() {
+   if (!firebaseAdmin) { logger.warn("firebase-admin absent : vérification REST uniquement"); return; }
+   const sa = parseServiceAccount(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+   if (!sa) { logger.warn("FIREBASE_SERVICE_ACCOUNT_JSON absent : vérification REST uniquement"); return; }
++  if (typeof firebaseAdmin.credential?.cert !== "function") {   // [FIX audit] firebase-admin >= 14 : API modulaire seulement → erreur claire au lieu de « reading 'cert' »
++    logger.error({ sdk: firebaseAdmin.SDK_VERSION || "inconnue" }, "firebase-admin incompatible : API namespacée (credential/apps/firestore) absente. Épingler firebase-admin ^13 ; vérification REST uniquement");
++    return;
++  }
+   try {
+     firebaseApp = (firebaseAdmin.apps && firebaseAdmin.apps.length)
+       ? firebaseAdmin.app()
+@@ -1857,7 +1862,15 @@ class ProviderHealth {
+     if (!n) { n = { key: k, samples: [], state: "closed", openUntil: 0, opens: 0, probing: false, hardStreak: 0, ewmaTtft: null, ewmaLatency: null, lastError: null, total: 0, failures: 0 }; this.nodes.set(k, n); }
+     return n;
+   }
++  /** [FIX audit] Oublie les échantillons trop anciens : sans cela un provider rétrogradé (score +4) n'était plus jamais essayé
++   *  tant que l'autre répondait, donc ses échecs ne vieillissaient jamais → pas de retour au fournisseur prioritaire. */
++  _prune(n) {
++    const cut = now() - CONFIG.HEALTH.SAMPLE_TTL_MS;
++    if (n.samples.length && n.samples.some((x) => x.t !== undefined && x.t < cut)) n.samples = n.samples.filter((x) => x.t === undefined || x.t >= cut);
++    if (n.lastError && n.lastError.at < cut) n.hardStreak = 0;
++  }
+   failRate(n) {
++    this._prune(n);
+     if (!n.samples.length) return 0;
+     return n.samples.reduce((a, s) => a + s.w, 0) / n.samples.length;
+   }
+@@ -1880,13 +1893,14 @@ class ProviderHealth {
+     const wasHalf = n.state === "half";
+     n.probing = false;
+     if (kind === "ok") {
+-      n.samples.push({ w: 0 }); n.hardStreak = 0;
++      n.samples.push({ w: 0, t: now() }); n.hardStreak = 0;
+       if (ttftMs !== null) n.ewmaTtft = n.ewmaTtft === null ? ttftMs : n.ewmaTtft * 0.8 + ttftMs * 0.2;
+       if (latencyMs !== null) n.ewmaLatency = n.ewmaLatency === null ? latencyMs : n.ewmaLatency * 0.8 + latencyMs * 0.2;
+       if (wasHalf || n.state === "open") { n.state = "closed"; n.opens = 0; n.samples = []; logger.info({ provider: n.key }, "disjoncteur FERMÉ (provider rétabli)"); }
+     } else {
+       const w = FAIL_WEIGHT[kind] ?? 1;
+-      n.samples.push({ w }); n.failures += w > 0 ? 1 : 0;
++      this._prune(n);
++      n.samples.push({ w, t: now() }); n.failures += w > 0 ? 1 : 0;
+       n.lastError = { kind, at: now() };
+       n.hardStreak = (kind === "server" || kind === "network" || kind === "model") ? n.hardStreak + 1 : 0;
+       const trip = wasHalf ? w > 0
+@@ -1900,6 +1914,12 @@ class ProviderHealth {
+     const cd = Math.min(CONFIG.HEALTH.MAX_COOLDOWN_MS, CONFIG.HEALTH.COOLDOWN_MS * 2 ** (n.opens - 1));
+     n.state = "open"; n.openUntil = now() + cd; n.hardStreak = 0;
+     logger.warn({ provider: n.key, kind, cooldownMs: cd, failRate: +this.failRate(n).toFixed(2) }, "disjoncteur OUVERT");
++    // [audit] alerte exploitable (filtre sur `alert`) quand plus AUCUN modèle suivi n'est disponible ; au plus 1 par minute
++    const all = [...this.nodes.values()];
++    if (all.length && all.every((x) => x.state === "open") && now() - (this._lastAlert || 0) > 60000) {
++      this._lastAlert = now();
++      logger.error({ alert: "LLM_ALL_PROVIDERS_OPEN", tracked: all.length, lastKind: kind }, "ALERTE : tous les modèles suivis sont indisponibles (disjoncteurs ouverts) — Luba répond par le message de secours");
++    }
+   }
+   /** Ordre d'essai : sains triés par (priorité + pénalités), puis ouverts en dernier recours. */
+   rank(chain) {
+@@ -1919,10 +1939,22 @@ class ProviderHealth {
+     }
+     return out;
+   }
+-  reset() { this.nodes.clear(); }
++  reset() { this.nodes.clear(); this._lastAlert = 0; }
+ }
+ const health = new ProviderHealth();
+ 
++/** [audit] État des fournisseurs EXTERNES, distinct de l'état du serveur : ok | degraded | down | unknown | unconfigured. */
++function llmHealthSummary() {
++  const configured = Object.entries(PROVIDERS).filter(([k, p]) => k !== "fake" && p.keys?.length).length;
++  if (CONFIG.FAKE_LLM) return { status: "simulated", configured: 1, tracked: 0, open: 0 };
++  if (!configured) return { status: "unconfigured", configured: 0, tracked: 0, open: 0 };
++  const nodes = Object.values(health.snapshot());
++  const open = nodes.filter((n) => n.state === "open").length;
++  const sick = nodes.filter((n) => n.failRate >= 0.5).length;
++  const status = !nodes.length ? "unknown" : open === nodes.length ? "down" : (open || sick) ? "degraded" : "ok";
++  return { status, configured, tracked: nodes.length, open };
++}
++
+ /** Clés d'un provider : cooldown INDIVIDUEL (un 429 met une clé de côté, pas tout le provider). */
+ class KeyPool {
+   constructor(name, keys) { this.name = name; this.keys = keys.map((k) => ({ ...k, until: 0 })); this.rr = 0; }
+@@ -2587,6 +2619,7 @@ function loadLegacy() {
+ /** API que le cœur v17 expose à l'héritage (le pipeline de chat v16.5 est remplacé par v17). */
+ const v17Api = {
+   chat: (args) => legacyChatBridge(args),
++  cancelRun: (run) => runManager.cancel(run.id, run.userId),   // [audit] annulation propagée jusqu'au fournisseur LLM (AbortController du run)
+   authenticate: (req, res, next) => authenticate()(req, res, next)
+ };
+ 
+@@ -2628,6 +2661,7 @@ async function legacyChatBridge({ conversationId, userId, firebaseUid = null, me
+     tier: modelTier === "v250" ? "v250" : "v100", images, googleAccessToken, channel, skipQuota: true
+   });
+   if (!s.run) return { reply: "", error: false, duplicate: true, conversationId, userId };
++  if (sse && typeof sse.onRun === "function") { try { sse.onRun(s.run); } catch {} }   // [audit] la voix (Luba Live) peut ainsi annuler la génération
+   const off = sse ? pipeRunToSse(s.run, sse) : null;
+   const r = await s.run.finished;
+   if (off) off();
+@@ -4351,7 +4385,7 @@ const chat = {
+         const big = chain.filter((pc) => pc.provider !== "groq");
+         if (big.length) chain = big;
+       }
+-      const ctx = { userId: run.userId, googleAccessToken: run.googleAccessToken, convId: run.convId, webRun: new WebRun() };
++      const ctx = { userId: run.userId, role: run.role, googleAccessToken: run.googleAccessToken, convId: run.convId, webRun: new WebRun() };   // [audit] rôle transmis aux outils (permissions Luba Engine)
+ 
+       // NGANDU v250 — double modèle : un architecte (raisonnement) prépare un plan, le constructeur (code) l'exécute.
+       if (!live && !hasImages && run.tier === "v250" && CONFIG.DUAL.ENABLED && !CONFIG.FAKE_LLM
+@@ -5387,7 +5421,8 @@ function buildApp() {
+   // ----- Publiques -----
+   app.get("/", (_req, res) => res.json({ name: "Luba AI Pro", version: CONFIG.VERSION, company: "HIKLON TECHNOLOGIES", status: "ok" }));
+   app.get("/api/health", wrap(async (req, res) => {
+-    const base = { status: runManager.draining ? "draining" : "ok", version: CONFIG.VERSION, uptimeS: Math.round(process.uptime()) };
++    // `status` = le SERVEUR (reste « ok » même si les fournisseurs LLM sont en panne : c'est ce que regarde Render) ; `llm` = fournisseurs externes.
++    const base = { status: runManager.draining ? "draining" : "ok", version: CONFIG.VERSION, uptimeS: Math.round(process.uptime()), llm: llmHealthSummary() };
+     if (req.query.full && hasDebugAccess(req)) return res.json({ ...base, ...diagnostics(), db: await db.health() });
+     return res.json(base);
+   }));
+@@ -5480,7 +5515,7 @@ function buildApp() {
+     const name = TOOL_ALIASES[asked] || asked;
+     const args = req.body?.args || req.body?.params || req.body?.arguments || {};
+     if (!getToolSchemas().some((s) => s.function.name === name)) throw Errors.badRequest("UNKNOWN_TOOL", "Outil inconnu.");
+-    const out = await withTimeout(executeTool({ toolName: name, args }, { userId: req.userId, googleAccessToken: req.headers["x-google-access-token"] || null, convId: null, webRun: new WebRun() }), CONFIG.TIMEOUTS.TOOL_MS * 2, null, `outil ${name}`);
++    const out = await withTimeout(executeTool({ toolName: name, args }, { userId: req.userId, role: req.userRole, googleAccessToken: req.headers["x-google-access-token"] || null, convId: null, webRun: new WebRun() }), CONFIG.TIMEOUTS.TOOL_MS * 2, null, `outil ${name}`);
+     res.json({ success: true, toolName: asked || name, ...out, reply: toolReplyText(out?.result) });
+   }));
+   app.post("/api/clear-cache", auth, rateLimit("API"), wrap(async (req, res) => {
+@@ -5546,6 +5581,8 @@ function validateEnvironment() {
+   logger.info({ providers: withKeys, fakeLlm: CONFIG.FAKE_LLM, node: process.version }, "environnement");
+   if (freeSources) logger.info({ tools: freeSources.schemas().length, version: freeSources.VERSION }, "sources gratuites chargées (free-sources.js)");
+   else if (fs.existsSync(path.join(__dirname, "free-sources.js")) && !envBool("DISABLE_FREE_SOURCES", false)) logger.warn("free-sources.js présent mais non chargeable (erreur de syntaxe ?)");
++  // [audit] piège de configuration : la base SQLite suit DB_PATH, PAS DATA_DIR. Un disque persistant monté via DATA_DIR ne la protège donc pas.
++  if (process.env.DATA_DIR && !process.env.DB_PATH && path.dirname(CONFIG.PATHS.DB) !== path.resolve(CONFIG.PATHS.DATA)) logger.warn({ DATA_DIR: CONFIG.PATHS.DATA, base_sqlite: CONFIG.PATHS.DB }, "DATA_DIR est défini mais pas DB_PATH : la base SQLite (historique) reste à son emplacement par défaut. Définir DB_PATH sur le disque persistant si tu veux la conserver entre redémarrages");
+   if (lubaEngine) logger.info({ version: lubaEngine.VERSION }, "Luba Engine chargé (luba-engine.js)");   // [LUBA ENGINE]
+   else if (fs.existsSync(path.join(__dirname, "luba-engine.js")) && !/^(0|false|no|off)$/i.test(process.env.ENGINE_ENABLED || "")) logger.warn("luba-engine.js présent mais non chargeable (erreur de syntaxe ?)");
+ }
+@@ -5587,7 +5624,9 @@ async function bootstrap({ listen = true } = {}) {
+   timers.push(startLoadMonitor());
+   if (!CONFIG.FAKE_LLM && envBool("STARTUP_LLM_CHECK", CONFIG.ENV !== "test")) {     // verdict immédiat dans les logs : quel modèle répond, lequel échoue et pourquoi
+     setTimeout(() => diagnoseProviders().then((r) => {
+-      for (const x of r) (x.ok ? logger.info : logger.error)(x, x.ok ? "auto-diagnostic LLM : OK" : "auto-diagnostic LLM : ÉCHEC");
++      // [FIX audit] Ne jamais détacher une méthode du logger (choisir logger.info ou logger.error dans un ternaire puis l'appeler) :
++      // pino lit `this` (Symbol(pino.msgPrefix)) ; la méthode détachée levait « Cannot read properties of undefined » et le résultat du diagnostic était perdu.
++      for (const x of r) { if (x.ok) logger.info(x, "auto-diagnostic LLM : OK"); else logger.error(x, "auto-diagnostic LLM : ÉCHEC"); }
+       if (!r.length) logger.error("auto-diagnostic LLM : aucune clé de modèle configurée");
+       else if (!r.some((x) => x.ok)) logger.error("auto-diagnostic LLM : AUCUN modèle ne répond → Luba ne pourra pas répondre (voir les lignes ÉCHEC ci-dessus)");
+     }).catch((e) => logger.warn({ err: e.message }, "auto-diagnostic LLM impossible")), 1500).unref();
+@@ -6566,11 +6605,16 @@ function initFirebase() {
+     return;
+   }
+   try {
++    // [FIX audit] le cœur v18 a déjà créé l'app par défaut : un 2e initializeApp() sans nom lève « app/duplicate-app »
++    // (c'était l'erreur « Init Firebase Admin échouée » alors que Firebase fonctionnait). On réutilise l'instance existante.
++    if (typeof firebaseAdmin.credential?.cert !== "function") throw new Error("API namespacée de firebase-admin absente (version >= 14 ?)");
+     const sa = parseFirebaseServiceAccount(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+-    firebaseApp = firebaseAdmin.initializeApp({
+-      credential: firebaseAdmin.credential.cert(sa),
+-      projectId: FIREBASE_CONFIG.projectId
+-    });
++    firebaseApp = (firebaseAdmin.apps && firebaseAdmin.apps.length)
++      ? firebaseAdmin.app()
++      : firebaseAdmin.initializeApp({
++        credential: firebaseAdmin.credential.cert(sa),
++        projectId: FIREBASE_CONFIG.projectId
++      });
+     if (Firestore) {
+       firestoreDb = new Firestore.Firestore({
+         projectId: FIREBASE_CONFIG.projectId,
+@@ -15525,6 +15569,7 @@ function setupLubaLiveWebSocket(server) {
+     });
+ 
+     ws.on("close", () => {
++      cancelLiveRun(state, "ws_close");   // [audit] client parti : on n'alimente plus une génération que personne n'écoute
+       liveSessions.delete(sid);
+       if (metrics?.activeWebSockets) metrics.activeWebSockets.labels("live").dec();
+     });
+@@ -15566,6 +15611,7 @@ async function handleLiveFrame(ws, state, frame) {
+ 
+   if (type === WS_FRAME.BARGE_IN) {
+     state.interrupted = true;
++    cancelLiveRun(state, "barge_in");
+     if (state.stt) state.stt.reset();
+     ws.send(encodeFrame(WS_FRAME.STATUS, { stage: "barge_in" }));
+     return;
+@@ -15594,6 +15640,16 @@ async function handleLiveFrame(ws, state, frame) {
+   }
+ }
+ 
++/** [audit] Annule la génération en cours d'une session vocale : plus personne n'écoute → on arrête de consommer du quota LLM. */
++function cancelLiveRun(state, why) {
++  const run = state.currentRun;
++  if (!run || run.isFinal) return false;
++  if (why === "ws_close" && process.env.LIVE_CANCEL_ON_CLOSE === "false") return false;
++  try { Promise.resolve(v17.cancelRun?.(run)).catch(() => {}); } catch {}
++  logger.info({ sessionId: state.sessionId, why }, "génération vocale annulée");
++  return true;
++}
++
+ async function handleLiveTurn(ws, state, userText) {
+   if (!userText) return;
+   state.interrupted = false;
+@@ -15629,6 +15685,7 @@ async function handleLiveTurn(ws, state, userText) {
+   try {
+     const sseAdp = {
+       closed: false,
++      onRun: (run) => { state.currentRun = run; },
+       status: (stage, extra) => { if (ws.readyState === 1) ws.send(encodeFrame(WS_FRAME.STATUS, { stage, ...extra })); },
+       reasoning: () => {},
+       codeBlock: () => {},
+@@ -15660,6 +15717,7 @@ async function handleLiveTurn(ws, state, userText) {
+       sse: sseAdp
+     });
+ 
++    state.currentRun = null;
+     chunker.flush();
+     // on attend la fin de la synthèse AVANT « DONE » : sinon l'audio arrive après et le navigateur parle en double
+     for (let w = 0; (ttsQ.length || ttsRunning) && !state.interrupted && ws.readyState === 1 && w < 600; w++) await new Promise((r) => setTimeout(r, 40));
+@@ -15669,6 +15727,7 @@ async function handleLiveTurn(ws, state, userText) {
+       ws.send(encodeFrame(WS_FRAME.DONE, { conversationId: state.conversationId }));
+     }
+   } catch (e) {
++    state.currentRun = null;
+     if (ws.readyState === 1) ws.send(encodeFrame(WS_FRAME.ERROR, { error: "Erreur de traitement" }));
+   }
+ }
+@@ -15996,7 +16055,7 @@ module.exports = {
+   CONFIG, logger, AppError, Errors, bus, db, Database, repo, MIGRATIONS,
+   TTLCache, TokenBucketLimiter, ThinkFilter, readSSE, makeWatchdog, fitContext, clipMiddle,
+   ProviderHealth, ProviderError, health, KeyPool, PROVIDERS, TIERS, tierChain, classifyHttp,
+-  lubaEngine, lubaEngineLlm,
++  lubaEngine, lubaEngineLlm, llmHealthSummary,
+   callLLM, orchestrate, streamOpenAI, streamGemini, streamFake,
+   Run, RunManager, runManager, chat, stripInlineImages, SSEStream, SyncHub, syncHub, MirrorWorker, mirrorState,
+   verifyToken, tokenCache, authenticate, buildApp, bootstrap, shutdown, diagnostics,
+diff --git a/luba-engine.js b/luba-engine.js
+index e86d6ff..13cac32 100644
+--- a/luba-engine.js
++++ b/luba-engine.js
+@@ -76,6 +76,11 @@ function buildConfig(o = {}) {
+     allowUnsandboxed: pick("allowUnsandboxed", envBool("ENGINE_ALLOW_UNSANDBOXED_EXEC", false)),
+     execTimeoutMs: pick("execTimeoutMs", envInt("ENGINE_EXEC_TIMEOUT_MS", 10000, 500, 120000)),
+     execMemMb: pick("execMemMb", envInt("ENGINE_EXEC_MEM_MB", 256, 32, 4096)),
++    execRoles: pick("execRoles", envStr("ENGINE_EXEC_ROLES", "ADMIN").split(",").map((x) => x.trim().toUpperCase()).filter(Boolean)),   // rôles autorisés à exécuter du code
++    exposeRunTool: pick("exposeRunTool", envBool("ENGINE_EXPOSE_RUN_TOOL", false)),    // opt-in explicite pour l'outil de chat engine_run_code
++    remoteUrl: pick("remoteUrl", envStr("ENGINE_REMOTE_EXEC_URL", "")),                // service d'exécution isolé EXTERNE (https)
++    remoteSecret: pick("remoteSecret", envStr("ENGINE_REMOTE_EXEC_SECRET", "")),       // secret HMAC partagé (jamais journalisé ni envoyé)
++    toolTimeoutMs: pick("toolTimeoutMs", envInt("ENGINE_TOOL_TIMEOUT_MS", 30000, 1000, 300000)),
+     workerMemMb: pick("workerMemMb", envInt("ENGINE_WORKER_MEM_MB", 384, 64, 4096)),   // plafond mémoire du worker Python (Render Free : 512 Mo au total)
+     cppStd: pick("cppStd", envStr("ENGINE_CPP_STD", "c++17"))
+   });
+@@ -410,6 +415,32 @@ function validatePlan(obj, { mode, fileExists, cfg }) {
+   return { diagnosis, notes, needFiles, plan };
+ }
+ 
++/**
++ * Validation d'arguments d'outil contre le schéma JSON annoncé au LLM (sous-ensemble : type, required, enum, minLength/maxLength,
++ * additionalProperties:false). Le LLM peut produire n'importe quoi : aucun outil n'exécute d'argument non validé.
++ */
++function validateArgs(schema, args) {
++  const errors = [];
++  const props = schema?.properties || {};
++  if (args === null || typeof args !== "object" || Array.isArray(args)) return ["arguments : objet attendu"];
++  for (const k of schema?.required || []) if (args[k] === undefined || args[k] === null) errors.push(`« ${k} » est requis`);
++  for (const [k, v] of Object.entries(args)) {
++    const d = props[k];
++    if (!d) { if (schema?.additionalProperties === false) errors.push(`« ${k} » n'est pas un argument connu`); continue; }
++    const t = d.type;
++    if (t === "string" && typeof v !== "string") { errors.push(`« ${k} » doit être un texte`); continue; }
++    if (t === "number" && typeof v !== "number") { errors.push(`« ${k} » doit être un nombre`); continue; }
++    if (t === "integer" && !Number.isInteger(v)) { errors.push(`« ${k} » doit être un entier`); continue; }
++    if (t === "boolean" && typeof v !== "boolean") { errors.push(`« ${k} » doit être un booléen`); continue; }
++    if (typeof v === "string") {
++      if (d.maxLength !== undefined && v.length > d.maxLength) errors.push(`« ${k} » dépasse ${d.maxLength} caractères`);
++      if (d.minLength !== undefined && v.length < d.minLength) errors.push(`« ${k} » est trop court`);
++    }
++    if (d.enum && !d.enum.includes(v)) errors.push(`« ${k} » doit valoir l'une des valeurs : ${d.enum.join(", ")}`);
++  }
++  return errors;
++}
++
+ /** Classification déterministe de la demande : on ne lance pas d'outils lourds ni le LLM quand une analyse locale suffit. */
+ function classify(mode, instruction, hasInput) {
+   let m = ["analyze", "fix", "create"].includes(mode) ? mode : "auto", reason = "demandé explicitement";
+@@ -471,22 +502,36 @@ function createEngine(options = {}) {
+         const exe = findExe(n);
+         if (!exe) continue;
+         const r = await runProcess(exe, ["--version"], { cwd: os.tmpdir(), timeoutMs: 5000 });
+-        if (r.code === 0) { caps.compilers[key] = { available: true, path: exe, version: r.stdout.split("\n")[0].trim() }; break; }
++        if (r.code === 0) {
++          // détecté ≠ exécutable : on compile réellement un programme trivial (entrée standard, aucun fichier) pour savoir si l'outil FONCTIONNE ici
++          const lang = key === "gxx" ? "c++" : "c";
++          const t = await runProcess(exe, ["-fsyntax-only", "-x", lang, "-"], { cwd: os.tmpdir(), timeoutMs: 15000, input: "int main(void){return 0;}\n" });
++          caps.compilers[key] = { available: true, path: exe, version: r.stdout.split("\n")[0].trim(), tested: t.code === 0, testDetail: t.code === 0 ? null : clip((t.stderr || `code ${t.code}`).trim(), 160) };
++          break;
++        }
+       }
+       if (!caps.compilers[key]) caps.compilers[key] = { available: false };
+     }
++    // Diagnostic : on garde la RAISON de chaque échec (sinon « isolation: null » reste inexplicable sur l'hébergeur).
++    const attempts = [];
+     const bwrap = findExe("bwrap");
+-    if (bwrap) {
++    if (!bwrap) attempts.push({ method: "bwrap", ok: false, reason: "binaire bwrap absent du PATH" });
++    else {
+       const r = await runProcess(bwrap, ["--unshare-all", "--die-with-parent", "--ro-bind", "/", "/", "true"], { cwd: os.tmpdir(), timeoutMs: 5000 });
++      attempts.push({ method: "bwrap", ok: r.code === 0, reason: r.code === 0 ? null : clip((r.stderr || `code ${r.code}`).trim(), 200) });
+       if (r.code === 0) caps.isolation = { method: "bwrap", strong: true, path: bwrap, detail: "système de fichiers + réseau + processus isolés" };
+     }
+     if (!caps.isolation.method) {
+       const unshare = findExe("unshare");
+-      if (unshare) {
++      if (!unshare) attempts.push({ method: "unshare", ok: false, reason: "binaire unshare absent du PATH" });
++      else {
+         const r = await runProcess(unshare, ["-r", "-n", "-p", "-f", "--mount-proc", "--kill-child", "--", "true"], { cwd: os.tmpdir(), timeoutMs: 5000 });
++        attempts.push({ method: "unshare", ok: r.code === 0, reason: r.code === 0 ? null : clip((r.stderr || `code ${r.code}`).trim(), 200) });
+         if (r.code === 0) caps.isolation = { method: "unshare", strong: false, path: unshare, detail: "réseau + processus isolés ; PAS d'isolation du système de fichiers (insuffisant pour du code non fiable)" };
+       }
+     }
++    caps.isolation.probe = attempts;
++    caps.remoteExec = { configured: Boolean(cfg.remoteUrl && cfg.remoteSecret) };
+     state.caps = caps;
+     if (caps.python.available) {
+       try { caps.worker = (await callWorker("capabilities", {}, { root: os.tmpdir() })).result; } catch (e) { caps.worker = { error: e.code || "WORKER_ERROR", message: e.message }; caps.python.available = false; }
+@@ -494,14 +539,52 @@ function createEngine(options = {}) {
+     return caps;
+   }
+ 
++  const remoteConfigured = () => Boolean(cfg.remoteUrl && cfg.remoteSecret);
++  /** Qui peut exécuter quoi, et où. Toute branche « refusée » dit POURQUOI (pour les journaux et l'API de capacités). */
+   const execPolicy = (role) => {
+     const c = state.caps?.isolation || {};
+     if (!cfg.allowExec) return { allowed: false, code: "EXECUTION_DISABLED", reason: "L'exécution de code est désactivée sur ce serveur (ENGINE_ALLOW_EXEC=false)." };
++    const r = String(role || "FREE").toUpperCase();
++    if (!cfg.execRoles.includes(r)) return { allowed: false, code: "FORBIDDEN_ROLE", reason: `L'exécution de code est réservée aux rôles : ${cfg.execRoles.join(", ")}.` };
+     if (c.strong) return { allowed: true, mode: "sandbox", isolation: c.method };
+-    if (cfg.allowUnsandboxed && role === "ADMIN") return { allowed: true, mode: "unsandboxed", isolation: c.method === "unshare" ? "unshare" : null, warning: "Exécution SANS isolation du système de fichiers (dérogation administrateur explicite)." };
+-    return { allowed: false, code: "ISOLATION_REQUIRED", reason: "Aucune isolation forte (bwrap) n'est disponible : l'exécution de code non fiable est refusée." };
++    if (remoteConfigured()) return { allowed: true, mode: "remote", isolation: null, warning: "Exécution déléguée à un service distant : son isolation n'est pas vérifiable depuis ce serveur." };
++    if (cfg.allowUnsandboxed && r === "ADMIN") return { allowed: true, mode: "unsandboxed", isolation: c.method === "unshare" ? "unshare" : null, warning: "Exécution SANS isolation du système de fichiers (dérogation administrateur explicite)." };
++    const why = (c.probe || []).filter((a) => !a.ok).map((a) => `${a.method}: ${a.reason}`).join(" | ");
++    return { allowed: false, code: "ISOLATION_REQUIRED", reason: `Aucune isolation forte n'est disponible : l'exécution de code non fiable est refusée.${why ? ` (sondes : ${why})` : ""} Option réaliste : service d'exécution distant (ENGINE_REMOTE_EXEC_URL).` };
+   };
+ 
++  // ----- exécution déléguée à un service ISOLÉ externe : requête et réponse signées (HMAC-SHA256), https obligatoire -----
++  const hmac = (secret, data) => crypto.createHmac("sha256", secret).update(data).digest("hex");
++  const safeEq = (a, b) => { const x = Buffer.from(String(a)), y = Buffer.from(String(b)); return x.length === y.length && crypto.timingSafeEqual(x, y); };
++  async function remoteExec({ language, code, stdin = "", signal = null }) {
++    let url;
++    try { url = new URL(cfg.remoteUrl); } catch { throw new EngineError("REMOTE_CONFIG", "ENGINE_REMOTE_EXEC_URL invalide.", { status: 500 }); }
++    const local = ["localhost", "127.0.0.1", "::1", "[::1]"].includes(url.hostname);
++    if (url.protocol !== "https:" && !local) throw new EngineError("REMOTE_INSECURE", "Le service d'exécution distant doit utiliser https.", { status: 500 });
++    const body = JSON.stringify({ v: PROTOCOL_VERSION, id: crypto.randomBytes(6).toString("hex"), language, code, stdin: String(stdin || "").slice(0, 64 * 1024), limits: { timeout_ms: cfg.execTimeoutMs, mem_mb: cfg.execMemMb, output_bytes: cfg.maxOutputBytes } });
++    const ts = String(Math.floor(Date.now() / 1000)), nonce = crypto.randomBytes(12).toString("hex");
++    const sig = hmac(cfg.remoteSecret, `${ts}.${nonce}.${sha256(body)}`);
++    const timeout = AbortSignal.timeout(cfg.execTimeoutMs + 5000);
++    const t0 = now();
++    let res, text;
++    try {
++      res = await fetch(url, { method: "POST", redirect: "error", headers: { "Content-Type": "application/json", "X-Luba-Timestamp": ts, "X-Luba-Nonce": nonce, "X-Luba-Signature": sig }, body, signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
++      const declared = parseInt(res.headers.get("content-length") || "0", 10);
++      if (declared > cfg.maxOutputBytes * 4) throw new EngineError("REMOTE_TOO_LARGE", "Réponse du service distant trop volumineuse.", { status: 502 });
++      text = await res.text();
++    } catch (e) {
++      if (e instanceof EngineError) throw e;
++      if (signal?.aborted) throw new EngineError("CANCELLED", "Tâche annulée.", { status: 499 });
++      throw new EngineError("REMOTE_UNAVAILABLE", timeout.aborted ? "Le service d'exécution distant n'a pas répondu à temps." : "Le service d'exécution distant est injoignable.", { status: 503, retryable: true });
++    }
++    if (text.length > cfg.maxOutputBytes * 4) throw new EngineError("REMOTE_TOO_LARGE", "Réponse du service distant trop volumineuse.", { status: 502 });
++    if (!res.ok) throw new EngineError("REMOTE_REFUSED", `Le service d'exécution distant a refusé la demande (HTTP ${res.status}).`, { status: 502 });
++    if (!safeEq(res.headers.get("x-luba-signature") || "", hmac(cfg.remoteSecret, `${ts}.${nonce}.${sha256(text)}`))) throw new EngineError("REMOTE_BAD_SIGNATURE", "Réponse du service distant non authentifiée : résultat rejeté.", { status: 502 });
++    let j; try { j = JSON.parse(text); } catch { throw new EngineError("REMOTE_BAD_RESPONSE", "Réponse du service distant illisible.", { status: 502 }); }
++    if (typeof j !== "object" || j === null || typeof j.stdout !== "string" || typeof j.stderr !== "string" || !(Number.isInteger(j.exitCode) || j.exitCode === null)) throw new EngineError("REMOTE_BAD_RESPONSE", "Réponse du service distant invalide.", { status: 502 });
++    return { exitCode: j.exitCode, stdout: clip(j.stdout, cfg.maxOutputBytes), stderr: clip(j.stderr, 8000), timedOut: Boolean(j.timedOut), outputTruncated: Boolean(j.outputTruncated) || j.stdout.length > cfg.maxOutputBytes, durationMs: now() - t0, isolation: "remote", remoteReportedIsolation: typeof j.isolation === "string" ? clip(j.isolation, 60) : null, warning: "Exécution déléguée à un service distant : son isolation n'est pas vérifiable depuis ce serveur." };
++  }
++
+   // ----- appel du worker Python (protocole JSON v1) -----
+   async function callWorker(op, args, { root, timeoutMs = cfg.stepTimeoutMs, signal = null } = {}) {
+     const py = state.caps?.python;
+@@ -557,7 +640,7 @@ function createEngine(options = {}) {
+       } else if (language === "c" || language === "cpp") {
+         if (path.extname(rel).toLowerCase() === ".h" || /\.(hpp|hh)$/i.test(rel)) { results.push(norm(rel, language, "skipped", null, { detail: "en-tête : vérifié à travers les fichiers sources qui l'incluent" })); continue; }
+         const comp = language === "cpp" ? state.caps?.compilers?.gxx : state.caps?.compilers?.gcc;
+-        if (!comp?.available) { results.push(norm(rel, language, "unavailable", null, { detail: `compilateur ${language === "cpp" ? "g++" : "gcc"} indisponible : aucune compilation effectuée` })); continue; }
++        if (!comp?.available || comp.tested === false) { results.push(norm(rel, language, "unavailable", null, { detail: `compilateur ${language === "cpp" ? "g++" : "gcc"} ${comp?.available ? "détecté mais auto-test en échec" : "indisponible"} : aucune compilation effectuée` })); continue; }
+         let text;
+         try { text = fs.readFileSync(path.join(root, rel), "utf8"); } catch { results.push(norm(rel, language, "skipped", null, { detail: "fichier illisible" })); continue; }
+         const bad = scanCppIncludes(text);
+@@ -608,6 +691,10 @@ function createEngine(options = {}) {
+     const lang = LANG_ALIASES[String(language || "").toLowerCase()];
+     if (!["python", "javascript", "c", "cpp"].includes(lang)) throw new EngineError("UNSUPPORTED_LANGUAGE", "Langage non exécutable (python, javascript, c, cpp).");
+     if (typeof code !== "string" || !code.trim() || Buffer.byteLength(code) > cfg.maxWriteBytes) throw new EngineError("BAD_INPUT", "Code vide ou trop volumineux.");
++    if (policy.mode === "remote") {
++      const rel = await acquire();
++      try { return { ...(await remoteExec({ language: lang, code, stdin, signal })), mode: "remote" }; } finally { rel(); }
++    }
+     const release = await acquire();
+     const dir = path.join(base(), newTaskId("scr"));
+     try {
+@@ -999,34 +1086,40 @@ function createEngine(options = {}) {
+   // ---------------------------------------------------------------------------------------------
+   const capsSummary = (admin = false) => {
+     const c = state.caps || {};
+-    const exec = execPolicy(admin ? "ADMIN" : null);
++    const exec = execPolicy(admin ? "ADMIN" : null);        // ce que PEUT faire le lecteur
++    const execCfg = execPolicy("ADMIN");                      // comment l'exécution est configurée sur ce serveur
+     const out = {
+       engine: c.engine, python: c.python?.available ? { available: true, version: c.python.version } : { available: false },
+-      node: c.node, compilers: { "g++": c.compilers?.gxx?.available ? { available: true, version: c.compilers.gxx.version } : { available: false }, gcc: c.compilers?.gcc?.available ? { available: true, version: c.compilers.gcc.version } : { available: false } },
++      node: c.node, compilers: { "g++": c.compilers?.gxx?.available ? { detected: true, version: c.compilers.gxx.version, tested: Boolean(c.compilers.gxx.tested), test_detail: c.compilers.gxx.testDetail || null } : { detected: false }, gcc: c.compilers?.gcc?.available ? { detected: true, version: c.compilers.gcc.version, tested: Boolean(c.compilers.gcc.tested), test_detail: c.compilers.gcc.testDetail || null } : { detected: false } },
+       resource_limits: Boolean(c.prlimit), isolation: { method: c.isolation?.method || null, strong: Boolean(c.isolation?.strong), detail: c.isolation?.detail || "aucune isolation disponible" },
+-      execution: exec.allowed ? { allowed: true, mode: exec.mode, warning: exec.warning || null } : { allowed: false, reason: exec.reason },
++      execution: { allowed: exec.allowed, mode: execCfg.allowed ? execCfg.mode : null, code: exec.allowed ? null : exec.code, reason: exec.allowed ? null : exec.reason, warning: execCfg.warning || null },
++      remote_exec: { configured: remoteConfigured(), requires_https: true, authenticated: "HMAC-SHA256" },
++      exec_roles: cfg.execRoles, run_tool_exposed_to_chat: runToolExposable(),
+       formats: c.worker?.formats || { note: "worker Python indisponible : formats complexes (ZIP, DOCX, PDF, XLSX…) non pris en charge" },
+       worker: c.worker?.worker_version ? { version: c.worker.worker_version, python: c.worker.python, modules: c.worker.modules } : (c.worker || null),
+       limits: { upload_mb: cfg.maxUploadBytes / MB, unpacked_mb: cfg.maxUnpackedBytes / MB, max_files: cfg.maxFiles, task_timeout_s: cfg.taskTimeoutMs / 1000, concurrent: cfg.maxConcurrent, ttl_min: cfg.taskTtlMs / 60000 },
+       persistence: "disque local éphémère (Render Free : perdu au redémarrage) — brancher options.storage / onTaskFinished pour un stockage durable"
+     };
+-    if (admin) { out.python_path = c.python?.path || null; out.prlimit = c.prlimit || null; }
++    if (admin) { out.python_path = c.python?.path || null; out.prlimit = c.prlimit || null; out.isolation.probe = c.isolation?.probe || []; }
+     return out;
+   };
+ 
+   const TOOLS = {
+     engine_check_code: {
+-      schema: { type: "function", function: { name: "engine_check_code", description: "VÉRIFIE réellement un extrait de code (syntaxe, et compilation « syntaxe seule » pour C/C++) avec les outils du serveur, sans l'exécuter. À utiliser pour contrôler du code avant de le présenter comme correct. Renvoie les erreurs ligne par ligne et indique les contrôles non réalisés.", parameters: { type: "object", properties: { language: { type: "string", description: "python, javascript, json, yaml, xml, html, css, c, cpp" }, code: { type: "string", description: "Le code à contrôler" } }, required: ["language", "code"] } } },
++      schema: { type: "function", function: { name: "engine_check_code", description: "VÉRIFIE réellement un extrait de code (syntaxe, et compilation « syntaxe seule » pour C/C++) avec les outils du serveur, sans l'exécuter. À utiliser pour contrôler du code avant de le présenter comme correct. Renvoie les erreurs ligne par ligne et indique les contrôles non réalisés.", parameters: { type: "object", properties: { language: { type: "string", description: "python, javascript, json, yaml, xml, html, css, c, cpp", maxLength: 20 }, code: { type: "string", description: "Le code à contrôler", minLength: 1, maxLength: 200000 } }, required: ["language", "code"], additionalProperties: false } } },
++      permissions: ["compute:local-readonly"], timeoutMs: 60000,
+       async exec(args) { return checkCode(args); }
+     },
+     engine_capabilities: {
+-      schema: { type: "function", function: { name: "engine_capabilities", description: "Liste ce que Luba Engine peut RÉELLEMENT faire sur ce serveur (formats, compilateurs, exécution, limites). À consulter avant de promettre une opération sur des fichiers.", parameters: { type: "object", properties: {}, required: [] } } },
++      schema: { type: "function", function: { name: "engine_capabilities", description: "Liste ce que Luba Engine peut RÉELLEMENT faire sur ce serveur (formats, compilateurs, exécution, limites). À consulter avant de promettre une opération sur des fichiers.", parameters: { type: "object", properties: {}, required: [], additionalProperties: false } } },
++      permissions: ["info:capabilities"], timeoutMs: 5000,
+       async exec() { return { success: true, ...capsSummary(false) }; }
+     },
+     engine_run_code: {
+-      schema: { type: "function", function: { name: "engine_run_code", description: "Exécute un petit programme dans un bac à sable isolé (sans réseau, délai et mémoire limités) et renvoie sa vraie sortie. Langages : python, javascript, c, cpp.", parameters: { type: "object", properties: { language: { type: "string" }, code: { type: "string" }, stdin: { type: "string", description: "Entrée standard facultative" } }, required: ["language", "code"] } } },
++      schema: { type: "function", function: { name: "engine_run_code", description: "Exécute un petit programme dans un bac à sable isolé (sans réseau, délai et mémoire limités) et renvoie sa vraie sortie. Langages : python, javascript, c, cpp.", parameters: { type: "object", properties: { language: { type: "string", enum: ["python", "javascript", "c", "cpp"] }, code: { type: "string", minLength: 1, maxLength: 200000 }, stdin: { type: "string", description: "Entrée standard facultative", maxLength: 65536 } }, required: ["language", "code"], additionalProperties: false } } },
++      permissions: ["exec:isolated"], timeoutMs: 45000,
+       async exec(args, ctx) {
+-        try { const r = await execCode({ language: args.language, code: args.code, stdin: args.stdin, role: null }); return { success: true, ...r, note: "Sortie réelle du programme exécuté dans le bac à sable." }; }
++        try { const r = await execCode({ language: args.language, code: args.code, stdin: args.stdin, role: ctx?.role || null }); return { success: true, ...r, note: "Sortie réelle du programme exécuté dans le bac à sable." }; }
+         catch (e) { return { success: false, code: e.code || "ENGINE_ERROR", error: e instanceof EngineError ? e.message : "Exécution impossible." }; }
+       }
+     }
+@@ -1053,13 +1146,34 @@ function createEngine(options = {}) {
+     finally { release(); try { removeDir(dir, base()); } catch { /* balayage ultérieur */ } }
+   }
+ 
+-  const isToolAvailable = (name) => state.ready && (name !== "engine_run_code" || Boolean(execPolicy(null).allowed && execPolicy(null).mode === "sandbox"));
++  // engine_run_code n'est annoncé au LLM que si : opt-in explicite (ENGINE_EXPOSE_RUN_TOOL) ET exécution autorisée ET isolation forte (bwrap) ou service distant authentifié.
++  // Un rôle autorisé est de toute façon revérifié à CHAQUE appel (ctx.role). La dérogation « sans isolation » n'expose JAMAIS l'outil au chat.
++  const runToolExposable = () => { const c = state.caps?.isolation || {}; return cfg.exposeRunTool && cfg.allowExec && (Boolean(c.strong) || remoteConfigured()); };
++  const isToolAvailable = (name) => state.ready && (name !== "engine_run_code" || runToolExposable());
+   const schemas = () => (state.ready ? Object.entries(TOOLS).filter(([n]) => isToolAvailable(n)).map(([, t]) => t.schema) : []);
+   const has = (name) => Boolean(TOOLS[name]) && isToolAvailable(name);
++  /** Exécution d'un outil : arguments validés, délai borné, résultat normalisé { success, …, meta:{ tool, durationMs, permissions } }. Ne lève jamais. */
+   async function execute(name, args, ctx) {
+-    if (!has(name)) return { result: { success: false, error: "Outil indisponible" }, sourceKeys: [] };
+-    try { return { result: await TOOLS[name].exec(args || {}, ctx || {}), sourceKeys: [] }; }
+-    catch (e) { log("error", { err: e?.message, tool: name }, "luba-engine : outil en échec"); return { result: { success: false, error: "Erreur interne du moteur." }, sourceKeys: [] }; }
++    if (!has(name)) return { result: { success: false, code: "TOOL_UNAVAILABLE", error: "Outil indisponible" }, sourceKeys: [] };
++    const tool = TOOLS[name];
++    const t0 = now();
++    const meta = (extra = {}) => ({ tool: name, durationMs: now() - t0, permissions: tool.permissions || [], timeoutMs: tool.timeoutMs || cfg.toolTimeoutMs, ...extra });
++    const errs = validateArgs(tool.schema.function.parameters, args === undefined ? {} : args);
++    if (errs.length) return { result: { success: false, code: "INVALID_ARGUMENTS", error: `Arguments invalides : ${errs.slice(0, 5).join(" ; ")}`, meta: meta() }, sourceKeys: [] };
++    let timer;
++    try {
++      const limit = Math.min(tool.timeoutMs || cfg.toolTimeoutMs, cfg.toolTimeoutMs);   // ENGINE_TOOL_TIMEOUT_MS plafonne tous les outils
++      const out = await Promise.race([
++        Promise.resolve(tool.exec(args || {}, ctx || {})),
++        new Promise((_, rej) => { timer = setTimeout(() => rej(new EngineError("TOOL_TIMEOUT", `L'outil ${name} a dépassé ${Math.round(limit / 1000)} s.`, { status: 504 })), limit); })
++      ]);
++      const result = out && typeof out === "object" ? out : { success: true, value: out };
++      return { result: { ...result, meta: meta() }, sourceKeys: [] };
++    } catch (e) {
++      if (e instanceof EngineError) return { result: { success: false, code: e.code, error: e.message, meta: meta() }, sourceKeys: [] };
++      log("error", { err: e?.message, tool: name }, "luba-engine : outil en échec");
++      return { result: { success: false, code: "ENGINE_INTERNAL", error: "Erreur interne du moteur.", meta: meta() }, sourceKeys: [] };
++    } finally { clearTimeout(timer); }
+   }
+ 
+   // ---------------------------------------------------------------------------------------------
+@@ -1143,7 +1257,7 @@ function createEngine(options = {}) {
+       state.timers.push(setInterval(() => { try { sweep(); } catch (e) { log("warn", { err: e.message }, "luba-engine : balayage en échec"); } }, 5 * 60000).unref());
+       state.ready = true;
+       const c = state.caps;
+-      log("info", { version: VERSION, python: c.python.available, compilers: { gxx: c.compilers.gxx.available, gcc: c.compilers.gcc.available }, isolation: c.isolation.method, exec: execPolicy(null).allowed, workdir: base() }, "luba-engine : prêt");
++      log("info", { version: VERSION, python: c.python.available, compilers: { gxx: c.compilers.gxx.available, gcc: c.compilers.gcc.available }, isolation: c.isolation.method, exec: execPolicy("ADMIN").allowed, exec_reason: execPolicy("ADMIN").allowed ? null : execPolicy("ADMIN").reason, isolation_probe: c.isolation.probe, workdir: base() }, "luba-engine : prêt");
+       if (!c.python.available) log("warn", {}, "luba-engine : Python/worker indisponible → mode dégradé (ZIP, DOCX, PDF, XLSX, contrôles Python/YAML/XML/HTML/CSS désactivés)");
+       return { ready: true, capabilities: capsSummary(true) };
+     } catch (e) {
+@@ -1185,5 +1299,5 @@ module.exports = {
+   schemas: () => defaultEngine.schemas(), has: (n) => defaultEngine.has(n), execute: (n, a, c) => defaultEngine.execute(n, a, c),
+   engine: defaultEngine,
+   // utilitaires purs (tests)
+-  __internals: { cleanRel, safeWritePath, validatePlan, extractJson, scanCppIncludes, parseCompilerDiagnostics, buildCommand, runProcess, scrubbedEnv, hashTree, findExe, classify, prepareWorkdir }
++  __internals: { cleanRel, safeWritePath, validatePlan, extractJson, scanCppIncludes, parseCompilerDiagnostics, buildCommand, runProcess, scrubbedEnv, hashTree, findExe, classify, prepareWorkdir, validateArgs }
+ };
