@@ -93,6 +93,10 @@ const crypto = require("crypto");
 const http = require("http");
 const { EventEmitter } = require("events");
 const { monitorEventLoopDelay } = require("perf_hooks");
+const { createOperationBudget, remainingMs, tryConsumeGeneration } = require("./llm-operation-budget.js");
+const { createWorker } = require("./worker.js");
+const { createLubaNet } = require("./luba-net.js");
+const { createLlmManager } = require("./luba-llm-gestionnaire.js");
 
 const express = tryRequire("express");
 const cors = tryRequire("cors");
@@ -434,6 +438,7 @@ const CONFIG = deepFreeze({
     WINDOW: envInt("HEALTH_WINDOW", 20),
     MIN_SAMPLES: envInt("HEALTH_MIN_SAMPLES", 6),
     OPEN_FAIL_RATE: envFloat("HEALTH_OPEN_FAIL_RATE", 0.7),
+    SAMPLE_TTL_MS: envInt("HEALTH_SAMPLE_TTL_MS", 120000),   // [FIX audit] péremption des échantillons par le TEMPS (avant : par nombre seulement)
     COOLDOWN_MS: envInt("HEALTH_COOLDOWN_MS", 20000),
     MAX_COOLDOWN_MS: envInt("HEALTH_MAX_COOLDOWN_MS", 120000),
     KEY_COOLDOWN_MS: envInt("KEY_COOLDOWN_MS", 15000),
@@ -1501,6 +1506,10 @@ function initFirebase() {
   if (!firebaseAdmin) { logger.warn("firebase-admin absent : vérification REST uniquement"); return; }
   const sa = parseServiceAccount(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
   if (!sa) { logger.warn("FIREBASE_SERVICE_ACCOUNT_JSON absent : vérification REST uniquement"); return; }
+  if (typeof firebaseAdmin.credential?.cert !== "function") {   // [FIX audit] firebase-admin >= 14 : API modulaire seulement → erreur claire au lieu de « reading 'cert' »
+    logger.error({ sdk: firebaseAdmin.SDK_VERSION || "inconnue" }, "firebase-admin incompatible : API namespacée (credential/apps/firestore) absente. Épingler firebase-admin ^13 ; vérification REST uniquement");
+    return;
+  }
   try {
     firebaseApp = (firebaseAdmin.apps && firebaseAdmin.apps.length)
       ? firebaseAdmin.app()
@@ -1847,7 +1856,7 @@ function noteLlmError(pc, err) {
   if (llmErrors.length > 40) llmErrors.shift();
 }
 
-const FAIL_WEIGHT = { rate_limit: 0.2, server: 1, network: 1, auth: 0.5, model: 1, empty: 1, timeout_first: 0.6, timeout_idle: 1, timeout_total: 0.6, context: 0, client: 0 };
+const FAIL_WEIGHT = { rate_limit: 0.2, server: 1, network: 1, auth: 0.5, model: 1, empty: 1, timeout_first: 0.6, timeout_idle: 1, timeout_total: 0.6, context: 0, client: 0, attempts_exhausted: 0, operation_timeout: 0 };
 
 class ProviderHealth {
   constructor() { this.nodes = new Map(); }
@@ -1857,7 +1866,15 @@ class ProviderHealth {
     if (!n) { n = { key: k, samples: [], state: "closed", openUntil: 0, opens: 0, probing: false, hardStreak: 0, ewmaTtft: null, ewmaLatency: null, lastError: null, total: 0, failures: 0 }; this.nodes.set(k, n); }
     return n;
   }
+  /** [FIX audit] Oublie les échantillons trop anciens : sans cela un provider rétrogradé (score +4) n'était plus jamais essayé
+   *  tant que l'autre répondait, donc ses échecs ne vieillissaient jamais → pas de retour au fournisseur prioritaire. */
+  _prune(n) {
+    const cut = now() - CONFIG.HEALTH.SAMPLE_TTL_MS;
+    if (n.samples.length && n.samples.some((x) => x.t !== undefined && x.t < cut)) n.samples = n.samples.filter((x) => x.t === undefined || x.t >= cut);
+    if (n.lastError && n.lastError.at < cut) n.hardStreak = 0;
+  }
   failRate(n) {
+    this._prune(n);
     if (!n.samples.length) return 0;
     return n.samples.reduce((a, s) => a + s.w, 0) / n.samples.length;
   }
@@ -1880,13 +1897,14 @@ class ProviderHealth {
     const wasHalf = n.state === "half";
     n.probing = false;
     if (kind === "ok") {
-      n.samples.push({ w: 0 }); n.hardStreak = 0;
+      n.samples.push({ w: 0, t: now() }); n.hardStreak = 0;
       if (ttftMs !== null) n.ewmaTtft = n.ewmaTtft === null ? ttftMs : n.ewmaTtft * 0.8 + ttftMs * 0.2;
       if (latencyMs !== null) n.ewmaLatency = n.ewmaLatency === null ? latencyMs : n.ewmaLatency * 0.8 + latencyMs * 0.2;
       if (wasHalf || n.state === "open") { n.state = "closed"; n.opens = 0; n.samples = []; logger.info({ provider: n.key }, "disjoncteur FERMÉ (provider rétabli)"); }
     } else {
       const w = FAIL_WEIGHT[kind] ?? 1;
-      n.samples.push({ w }); n.failures += w > 0 ? 1 : 0;
+      this._prune(n);
+      n.samples.push({ w, t: now() }); n.failures += w > 0 ? 1 : 0;
       n.lastError = { kind, at: now() };
       n.hardStreak = (kind === "server" || kind === "network" || kind === "model") ? n.hardStreak + 1 : 0;
       const trip = wasHalf ? w > 0
@@ -1900,6 +1918,12 @@ class ProviderHealth {
     const cd = Math.min(CONFIG.HEALTH.MAX_COOLDOWN_MS, CONFIG.HEALTH.COOLDOWN_MS * 2 ** (n.opens - 1));
     n.state = "open"; n.openUntil = now() + cd; n.hardStreak = 0;
     logger.warn({ provider: n.key, kind, cooldownMs: cd, failRate: +this.failRate(n).toFixed(2) }, "disjoncteur OUVERT");
+    // [audit] alerte exploitable (filtre sur `alert`) quand plus AUCUN modèle suivi n'est disponible ; au plus 1 par minute
+    const all = [...this.nodes.values()];
+    if (all.length && all.every((x) => x.state === "open") && now() - (this._lastAlert || 0) > 60000) {
+      this._lastAlert = now();
+      logger.error({ alert: "LLM_ALL_PROVIDERS_OPEN", tracked: all.length, lastKind: kind }, "ALERTE : tous les modèles suivis sont indisponibles (disjoncteurs ouverts) — Luba répond par le message de secours");
+    }
   }
   /** Ordre d'essai : sains triés par (priorité + pénalités), puis ouverts en dernier recours. */
   rank(chain) {
@@ -1919,9 +1943,21 @@ class ProviderHealth {
     }
     return out;
   }
-  reset() { this.nodes.clear(); }
+  reset() { this.nodes.clear(); this._lastAlert = 0; }
 }
 const health = new ProviderHealth();
+
+/** [audit] État des fournisseurs EXTERNES, distinct de l'état du serveur : ok | degraded | down | unknown | unconfigured. */
+function llmHealthSummary() {
+  const configured = Object.entries(PROVIDERS).filter(([k, p]) => k !== "fake" && p.keys?.length).length;
+  if (CONFIG.FAKE_LLM) return { status: "simulated", configured: 1, tracked: 0, open: 0 };
+  if (!configured) return { status: "unconfigured", configured: 0, tracked: 0, open: 0 };
+  const nodes = Object.values(health.snapshot());
+  const open = nodes.filter((n) => n.state === "open").length;
+  const sick = nodes.filter((n) => n.failRate >= 0.5).length;
+  const status = !nodes.length ? "unknown" : open === nodes.length ? "down" : (open || sick) ? "degraded" : "ok";
+  return { status, configured, tracked: nodes.length, open };
+}
 
 /** Clés d'un provider : cooldown INDIVIDUEL (un 429 met une clé de côté, pas tout le provider). */
 class KeyPool {
@@ -2180,6 +2216,18 @@ async function streamFake({ pc, messages, tools, wd, h }) {
     wd.beat();
     return { text: "", reasoning: "", usage: null, toolCalls: [{ id: "call_fakeweb", type: "function", function: { name: "web_slow", arguments: JSON.stringify({ query: "luba test" }) } }] };
   }
+  // Test-only probe: emit a registered Luba Engine tool call, then verify its actual result returns to the next turn.
+  if (/\[engine_tool\]/.test(lastText) && !sawTool && tools?.some((t) => t.function?.name === "engine_capabilities")) {
+    wd.beat();
+    return { text: "", reasoning: "", usage: null, toolCalls: [{ id: "call_fakeengine", type: "function", function: { name: "engine_capabilities", arguments: "{}" } }] };
+  }
+  // Test-only probe: prove the orchestrator sends the actual tool result back on the next model turn.
+  const lastToolMessage = [...messages].reverse().find((m) => m.role === "tool");
+  if (/\[tool_echo\]/.test(lastText) && lastToolMessage) {
+    const text = `TOOL_RESULT_RECEIVED:${String(lastToolMessage.content || "").slice(0, 2000)}`;
+    wd.beat(); h.onText(text);
+    return { text, reasoning: "", toolCalls: [], usage: null, finish: "stop" };
+  }
   if (/\[tool\]/.test(lastText) && !sawTool) {
     wd.beat();
     return { text: "", reasoning: "", usage: null, toolCalls: [{ id: "call_fake1", type: "function", function: { name: "get_current_time", arguments: "{}" } }] };
@@ -2248,6 +2296,8 @@ const FRIENDLY = {
   timeout_first: "La réflexion a pris trop de temps. Réessaie, ou pose la question en plus court.",
   timeout_idle: "La connexion au modèle s'est interrompue. Réessaie dans un instant.",
   timeout_total: "La réponse a pris trop de temps. Réessaie avec une question plus ciblée.",
+  attempts_exhausted: "La limite de tentatives du modèle a été atteinte pour cette opération. Réessaie avec une demande plus ciblée.",
+  operation_timeout: "La tâche a dépassé le délai maximal autorisé. Les résultats partiels validés sont conservés lorsqu'ils sont disponibles.",
   context: "Le message est trop long pour être traité. Raccourcis-le ou découpe-le.",
   auth: "Luba est momentanément indisponible (accès au modèle en cours de vérification). Réessaie un peu plus tard.",
   model: "Luba est momentanément indisponible (modèle en cours de mise à jour). Réessaie un peu plus tard.",
@@ -2296,7 +2346,9 @@ const toolTokens = (tools) => (tools && tools.length ? Math.min(6000, estimateTo
  *   • 400 avec outils (ex. « tool_use_failed ») : on réessaie SANS outils ;
  *   • réponse vide d'un modèle de raisonnement (tout dépensé en « réflexion ») : on réessaie avec un effort plus bas.
  */
-async function callLLM({ chain, messages, tools, images, lane, signal, deadlineAt, emit, toolChoice = null, profile = null }) {
+async function callLLM({ chain, messages, tools, images, lane, signal, deadlineAt, emit, toolChoice = null, profile = null, generationBudget = null }) {
+  const operationBudget = generationBudget || createOperationBudget({ deadlineAt });
+  deadlineAt = Math.min(Number.isFinite(deadlineAt) ? deadlineAt : operationBudget.deadlineAt, operationBudget.deadlineAt);
   const T = profile === "live" ? CONFIG.TIMEOUTS.LIVE : lane === "heavy" ? CONFIG.TIMEOUTS.HEAVY : CONFIG.TIMEOUTS.LIGHT;
   const { healthy, lastResort } = health.rank(chain);
   const order = [...healthy, ...lastResort];
@@ -2305,7 +2357,15 @@ async function callLLM({ chain, messages, tools, images, lane, signal, deadlineA
   let committed = "";
   let lastErr = null;
 
-  for (const pc of order) {
+  providerLoop: for (const pc of order) {
+    if (operationBudget.attempts >= operationBudget.maxAttempts) {
+      lastErr = new ProviderError("attempts_exhausted", "limite globale de générations LLM atteinte");
+      break providerLoop;
+    }
+    if (remainingMs(operationBudget, now(), deadlineAt) <= 0) {
+      lastErr = new ProviderError("operation_timeout", "délai global maximal de l'opération dépassé");
+      break providerLoop;
+    }
     const cfg = PROVIDERS[pc.provider];
     const pool = keyPools[pc.provider];
     const learned = activeLimits(pc);
@@ -2329,7 +2389,13 @@ async function callLLM({ chain, messages, tools, images, lane, signal, deadlineA
       }
       if (!health.acquire(pc)) break;
 
-      const wd = makeWatchdog({ firstMs: T.FIRST_TOKEN_MS, idleMs: T.IDLE_MS, totalMs: Math.min(T.TOTAL_MS, remaining - 500), parent: signal });
+      const permit = tryConsumeGeneration(operationBudget, now(), deadlineAt);
+      if (!permit.ok) {
+        health.release(pc);
+        lastErr = new ProviderError(permit.code === "LLM_ATTEMPTS_EXHAUSTED" ? "attempts_exhausted" : "operation_timeout", permit.message);
+        break providerLoop;
+      }
+      const wd = makeWatchdog({ firstMs: Math.min(T.FIRST_TOKEN_MS, remaining - 500), idleMs: Math.min(T.IDLE_MS, remaining - 500), totalMs: Math.min(T.TOTAL_MS, remaining - 500), parent: signal });
       const startedAt = now();
       let ttft = null;
       const filter = new ThinkFilter();
@@ -2348,7 +2414,7 @@ async function callLLM({ chain, messages, tools, images, lane, signal, deadlineA
         : workHere;
 
       try {
-        emit.status("generating", { provider: pc.provider, model: pc.model, attempt: attempt + 1 });
+        emit.status("generating", { provider: pc.provider, model: pc.model, attempt: permit.attempt, maxAttempts: operationBudget.maxAttempts });
         const streamer = cfg.kind === "gemini" ? streamGemini : cfg.kind === "fake" ? streamFake : streamOpenAI;
         const r = await streamer({ pc: { ...pcx, reasoningEffort: effort }, cfg, key, messages: sendMessages, tools: toolsHere, images, wd, h, toolChoice });
         const tail = filter.flush();
@@ -2423,7 +2489,9 @@ async function callLLM({ chain, messages, tools, images, lane, signal, deadlineA
 
 const stableStringify = (o) => safeJsonStringify(o, "{}");
 
-async function orchestrate({ chain, lane, messages, images, tools, executeTool, signal, deadlineAt, emit, profile = null, maxIterations = null, toolTimeoutMs = null }) {
+async function orchestrate({ chain, lane, messages, images, tools, executeTool, signal, deadlineAt, emit, profile = null, maxIterations = null, toolTimeoutMs = null, generationBudget = null }) {
+  const operationBudget = generationBudget || createOperationBudget({ deadlineAt });
+  deadlineAt = Math.min(Number.isFinite(deadlineAt) ? deadlineAt : operationBudget.deadlineAt, operationBudget.deadlineAt);
   const working = [...messages];
   const sources = new Set(), imagesOut = [], videosOut = [], trace = [], segments = [];
   const toolCache = new Map();
@@ -2449,9 +2517,13 @@ async function orchestrate({ chain, lane, messages, images, tools, executeTool, 
     emit.status("tool", { name });
     trace.push({ name, args });
     let out;
-    try { out = await withTimeout(executeTool({ toolName: name, args }), toolTimeoutMs || CONFIG.TIMEOUTS.TOOL_MS, signal, `outil ${name}`); }
+    try {
+      const left = remainingMs(operationBudget, now(), deadlineAt);
+      if (left <= 0) throw new ProviderError("operation_timeout", "budget global épuisé avant l'outil");
+      out = await withTimeout(executeTool({ toolName: name, args }), Math.max(1, Math.min(toolTimeoutMs || CONFIG.TIMEOUTS.TOOL_MS, left)), signal, `outil ${name}`);
+    }
     catch (e) {
-      if (signal.aborted) throw e;
+      if (signal.aborted || (e instanceof ProviderError && ["operation_timeout", "attempts_exhausted"].includes(e.kind))) throw e;
       if (/délai dépassé/.test(String(e.message))) deadTools.set(name, "trop lent");
       out = { result: { success: false, error: String(e.message || e).slice(0, 300) }, sourceKeys: [] };
     }
@@ -2468,28 +2540,41 @@ async function orchestrate({ chain, lane, messages, images, tools, executeTool, 
   };
 
   for (let it = 1; it <= maxIt; it++) {
+    if (remainingMs(operationBudget, now(), deadlineAt) <= 0) { partial = Boolean(segments.join("\n\n").trim()); error = new ProviderError("operation_timeout", "délai global maximal de l'opération dépassé"); break; }
+    if (operationBudget.attempts >= operationBudget.maxAttempts) { partial = Boolean(segments.join("\n\n").trim()); error = new ProviderError("attempts_exhausted", "limite globale de générations LLM atteinte"); break; }
     emit.status(it === 1 ? "thinking" : "reasoning", { iteration: it });
     const fitted = fitContext(working, ctxBudget());
-    let r = await callLLM({ chain, messages: fitted.messages, tools, images, lane, signal, deadlineAt, emit, profile });
+    // Réserver la dernière génération globale (ou le dernier tour) à une réponse finale sans outils.
+    const finalModelTurn = it === maxIt || operationBudget.attempts >= operationBudget.maxAttempts - 1;
+    let r = await callLLM({ chain, messages: fitted.messages, tools: finalModelTurn ? null : tools, toolChoice: finalModelTurn ? "none" : null, images, lane, signal, deadlineAt, emit, profile, generationBudget: operationBudget });
     provider = r.provider; model = r.model; ttftMs = ttftMs ?? r.ttftMs; reasoning += r.reasoning || ""; addUsage(r.usage);
 
     // v18 : réponse COUPÉE par la limite de jetons (code / site web longs) → on poursuit automatiquement, sans répéter.
     let cuts = 0;
-    while (!r.partial && !r.toolCalls.length && isTruncated(r.finish) && cuts < CONFIG.LIMITS.MAX_CONTINUATIONS && deadlineAt - now() > 10000) {
+    while (!r.partial && !r.toolCalls.length && isTruncated(r.finish) && cuts < CONFIG.LIMITS.MAX_CONTINUATIONS && deadlineAt - now() > 10000 && operationBudget.attempts < operationBudget.maxAttempts) {
       cuts++;
       emit.status("continuing", { part: cuts + 1 });
       const sysMsgs = fitted.messages.filter((m) => m.role === "system");
       const lastUser = [...fitted.messages].reverse().find((m) => m.role === "user");
       const contMsgs = [...sysMsgs, ...(lastUser ? [lastUser] : []), { role: "assistant", content: clipMiddle(r.text, 7000) }, { role: "user", content: CONTINUE_PROMPT }];
-      const more = await callLLM({ chain, messages: contMsgs, tools: null, images: null, lane, signal, deadlineAt, emit, profile });
+      const more = await callLLM({ chain, messages: contMsgs, tools: null, images: null, lane, signal, deadlineAt, emit, profile, generationBudget: operationBudget });
       addUsage(more.usage);
       provider = more.provider; model = more.model;
       r = { ...more, text: r.text + more.text, toolCalls: [], reasoning: r.reasoning };
+    }
+    if (!r.partial && isTruncated(r.finish) && operationBudget.attempts >= operationBudget.maxAttempts) {
+      r = { ...r, partial: true, error: new ProviderError("attempts_exhausted", "La réponse reste tronquée après la dernière génération autorisée.") };
     }
 
     if (r.text.trim()) segments.push(r.text);
     if (r.partial) { partial = true; error = r.error; break; }
     if (!r.toolCalls.length) break;
+    // Le dernier créneau de génération doit produire une réponse finale, pas déclencher des outils impossibles à synthétiser.
+    if (it === maxIt || operationBudget.attempts >= operationBudget.maxAttempts || remainingMs(operationBudget, now(), deadlineAt) <= 0) {
+      partial = true;
+      error = new ProviderError(operationBudget.attempts >= operationBudget.maxAttempts ? "attempts_exhausted" : "server", "L'agent a atteint sa limite de tours avant de pouvoir synthétiser l'outil.");
+      break;
+    }
 
     working.push({ role: "assistant", content: r.text || "", tool_calls: r.toolCalls });
     const bounded = r.toolCalls.slice(0, CONFIG.AGENT.MAX_TOOL_CALLS_PER_STEP);
@@ -2510,7 +2595,7 @@ async function orchestrate({ chain, lane, messages, images, tools, executeTool, 
       working.push({ role: "system", content: outOfBudget && it < maxIt
         ? "Les outils externes sont lents ou indisponibles. Réponds MAINTENANT avec ce que tu as déjà obtenu et tes connaissances, en précisant honnêtement ce que tu n'as pas pu vérifier. N'appelle plus d'outil."
         : "Synthétise ta réponse finale MAINTENANT. Pas de nouvel appel d'outil." });
-      const f = await callLLM({ chain, messages: fitContext(working, ctxBudget()).messages, tools, toolChoice: "none", images, lane, signal, deadlineAt, emit, profile });
+      const f = await callLLM({ chain, messages: fitContext(working, ctxBudget()).messages, tools, toolChoice: "none", images, lane, signal, deadlineAt, emit, profile, generationBudget: operationBudget });
       provider = f.provider; model = f.model; addUsage(f.usage);
       if (f.text.trim()) segments.push(f.text);
       partial = f.partial; error = f.error || null;
@@ -2587,6 +2672,7 @@ function loadLegacy() {
 /** API que le cœur v17 expose à l'héritage (le pipeline de chat v16.5 est remplacé par v17). */
 const v17Api = {
   chat: (args) => legacyChatBridge(args),
+  cancelRun: (run) => runManager.cancel(run.id, run.userId),   // [audit] annulation propagée jusqu'au fournisseur LLM (AbortController du run)
   authenticate: (req, res, next) => authenticate()(req, res, next)
 };
 
@@ -2628,6 +2714,7 @@ async function legacyChatBridge({ conversationId, userId, firebaseUid = null, me
     tier: modelTier === "v250" ? "v250" : "v100", images, googleAccessToken, channel, skipQuota: true
   });
   if (!s.run) return { reply: "", error: false, duplicate: true, conversationId, userId };
+  if (sse && typeof sse.onRun === "function") { try { sse.onRun(s.run); } catch {} }   // [audit] la voix (Luba Live) peut ainsi annuler la génération
   const off = sse ? pipeRunToSse(s.run, sse) : null;
   const r = await s.run.finished;
   if (off) off();
@@ -3412,14 +3499,15 @@ async function executeTool({ toolName, args }, ctx) {
 
 // ----- [LUBA ENGINE] Adaptateur LLM : réutilise callLLM / tierChain de Milo (aucun second fournisseur, aucune clé dupliquée) -----
 // Le moteur y envoie un contexte structuré et reçoit du TEXTE ; il le valide lui-même (JSON, chemins, opérations autorisées).
-async function lubaEngineLlm({ messages, tier = "v100", signal = null, timeoutMs = 90000 }) {
+async function lubaEngineLlm({ messages, tier = "v100", signal = null, timeoutMs = 90000, generationBudget = null, deadlineAt = null }) {
   const chain = tierChain(tier === "v250" ? "v250" : "v100", { code: tier === "v250" });
   const ac = new AbortController();
   const onAbort = () => ac.abort();
   if (signal) { if (signal.aborted) ac.abort(); else signal.addEventListener("abort", onAbort, { once: true }); }
   const noop = () => {};
   try {
-    const r = await callLLM({ chain, messages, tools: null, images: null, lane: "heavy", signal: ac.signal, deadlineAt: now() + timeoutMs, emit: { status: noop, token: noop, reasoning: noop } });
+    const localDeadline = Math.min(Number.isFinite(deadlineAt) ? deadlineAt : now() + timeoutMs, now() + timeoutMs, generationBudget?.deadlineAt ?? Infinity);
+    const r = await callLLM({ chain, messages, tools: null, images: null, lane: "heavy", signal: ac.signal, deadlineAt: localDeadline, emit: { status: noop, token: noop, reasoning: noop }, generationBudget });
     return { text: r.text || "", provider: r.provider, model: r.model, partial: Boolean(r.partial) };
   } finally { if (signal) signal.removeEventListener("abort", onAbort); }
 }
@@ -4110,7 +4198,7 @@ function buildHistory(rows, userIdx, { live = false } = {}) {
 }
 
 // ---------- Double modèle (Ngandu v250) : architecte (raisonnement) puis constructeur ----------
-async function architectPlan({ messages, intent, signal, deadlineAt, emit }) {
+async function architectPlan({ messages, intent, signal, deadlineAt, emit, generationBudget = null }) {
   const chain = tierChain("v250", { hasImages: false, code: false }).map((pc) => ({ ...pc, maxTokens: Math.min(pc.maxTokens, CONFIG.DUAL.PLAN_MAX_TOKENS), temperature: 0.4 }));
   if (!chain.length) return null;
   const ctx = messages.filter((m) => m.role !== "system").slice(-5);
@@ -4119,13 +4207,13 @@ async function architectPlan({ messages, intent, signal, deadlineAt, emit }) {
   let planText = "";
   const quiet = { status() {}, token: (t) => { planText += t; }, reasoning() {}, images() {}, videos() {}, code() {} };
   emit.status("planning", { intent });
-  const r = await callLLM({ chain, messages: [{ role: "system", content: ARCHITECT_PROMPTS[intent] || ARCHITECT_PROMPTS.DEFAULT }, ...ctx], tools: null, images: null, lane: "heavy", signal, deadlineAt: Math.min(deadlineAt, now() + CONFIG.DUAL.PLAN_TIMEOUT_MS), emit: quiet });
+  const r = await callLLM({ chain, messages: [{ role: "system", content: ARCHITECT_PROMPTS[intent] || ARCHITECT_PROMPTS.DEFAULT }, ...ctx], tools: null, images: null, lane: "heavy", signal, deadlineAt: Math.min(deadlineAt, now() + CONFIG.DUAL.PLAN_TIMEOUT_MS), emit: quiet, generationBudget });
   const text = formatFinalReply(r.text || planText);
   return text.length > 40 ? text.slice(0, 6000) : null;
 }
 
 // ---------- Réponse de SECOURS : si toute la chaîne échoue, on tente un dernier passage simplifié ----------
-async function rescueAnswer({ messages, hasImages, signal, emit, cause }) {
+async function rescueAnswer({ messages, hasImages, signal, emit, cause, generationBudget = null, deadlineAt = null }) {
   const seen = new Set(), chain = [];
   for (const pc of [...TIERS.v100.chain, ...TIERS.v250.chain, ...TIERS.v250.code]) {
     const k = limitKey(pc);
@@ -4141,7 +4229,8 @@ async function rescueAnswer({ messages, hasImages, signal, emit, cause }) {
   const last = tail[tail.length - 1];
   last.content = clipMiddle(last.content, 3500) + (hasImages ? "\n\n[NOTE SYSTÈME : l'image jointe n'a pas pu être analysée (service de vision momentanément indisponible). Dis-le brièvement, puis réponds du mieux possible à la partie texte de la demande.]" : "");
   emit.status("rescue", {});
-  const r = await callLLM({ chain, messages: [...sys, ...tail], tools: null, images: null, lane: "light", signal, deadlineAt: now() + CONFIG.RESCUE.TIMEOUT_MS, emit });
+  const rescueDeadline = Math.min(Number.isFinite(deadlineAt) ? deadlineAt : now() + CONFIG.RESCUE.TIMEOUT_MS, now() + CONFIG.RESCUE.TIMEOUT_MS, generationBudget?.deadlineAt ?? Infinity);
+  const r = await callLLM({ chain, messages: [...sys, ...tail], tools: null, images: null, lane: "light", signal, deadlineAt: rescueDeadline, emit, generationBudget });
   return { text: r.text, reasoning: "", sources: [], images: [], videos: [], trace: [], provider: r.provider, model: r.model, ttftMs: r.ttftMs, usage: { prompt: 0, completion: 0 }, partial: r.partial, error: r.error || null, rescued: true };
 }
 /** Ferme un bloc de code resté ouvert (réponse coupée) pour que l'affichage ne casse pas. */
@@ -4262,9 +4351,10 @@ const chat = {
   async execute(run) {
     const live = Boolean(run.live);
     const T = live ? CONFIG.TIMEOUTS.LIVE : CONFIG.TIMEOUTS.LIGHT;
-    let deadlineAt = now() + T.TOTAL_MS;      // ajusté plus bas selon la nature de la demande (4 min / 10 min)
-    const signal = run.controller.signal;
     const startedAt = now();
+    let deadlineAt = startedAt + T.TOTAL_MS;
+    let generationBudget = null;
+    const signal = run.controller.signal;
     const speech = live ? new SpeechSanitizer() : null;     // Luba Live : on ne laisse passer que du texte « parlable »
     const emit = {
       status: (stage, extra) => run.push("status", { stage, ...extra }),
@@ -4289,7 +4379,9 @@ const chat = {
       // Durée accordée : message ordinaire 4 min ; code / site web / document / très long message 10 min
       const bigJob = !live && (["CODE", "WEBSITE", "DOCUMENT"].includes(intent) || run.message.length > 1500 || Boolean(run.docs?.length));
       const tlane = bigJob ? "heavy" : "light";
-      if (!live) deadlineAt = now() + (bigJob ? CONFIG.TIMEOUTS.HEAVY : CONFIG.TIMEOUTS.LIGHT).TOTAL_MS;
+      if (!live) deadlineAt = startedAt + (bigJob ? CONFIG.TIMEOUTS.HEAVY : CONFIG.TIMEOUTS.LIGHT).TOTAL_MS;
+      generationBudget = createOperationBudget({ startedAt, deadlineAt });
+      deadlineAt = generationBudget.deadlineAt;
       const imgReq = !live && !(run.images && run.images.length) && !run.docs?.length && isImageSearchRequest(run.message);   // « montre-moi des images de … » : galerie seule
       const wantsEnrich = !live && !imgReq && !["SMALLTALK", "CODE", "GENERAL", "WEBSITE", "DOCUMENT", "MATH"].includes(intent) && legacy?.enrichContextWithIntent;
 
@@ -4351,12 +4443,12 @@ const chat = {
         const big = chain.filter((pc) => pc.provider !== "groq");
         if (big.length) chain = big;
       }
-      const ctx = { userId: run.userId, googleAccessToken: run.googleAccessToken, convId: run.convId, webRun: new WebRun() };
+      const ctx = { userId: run.userId, role: run.role, googleAccessToken: run.googleAccessToken, convId: run.convId, webRun: new WebRun(), signal };   // [audit] rôle transmis aux outils (permissions Luba Engine)
 
       // NGANDU v250 — double modèle : un architecte (raisonnement) prépare un plan, le constructeur (code) l'exécute.
       if (!live && !hasImages && run.tier === "v250" && CONFIG.DUAL.ENABLED && !CONFIG.FAKE_LLM
           && (["CODE", "WEBSITE", "DOCUMENT", "MATH"].includes(intent) || run.message.length > 700 || run.docs?.length)) {
-        const plan = await settle(architectPlan({ messages, intent, signal, deadlineAt, emit }), CONFIG.DUAL.PLAN_TIMEOUT_MS + 2000, null);
+        const plan = await settle(architectPlan({ messages, intent, signal, deadlineAt, emit, generationBudget }), Math.min(CONFIG.DUAL.PLAN_TIMEOUT_MS + 2000, Math.max(1, deadlineAt - now())), null);
         if (plan && !signal.aborted) {
           const lastUser = messages[messages.length - 1];
           lastUser.content += `\n\n[PLAN DE L'ARCHITECTE — document interne : applique-le avec rigueur, ne le recopie pas et ne mentionne pas son existence]\n${plan}`;
@@ -4375,14 +4467,15 @@ const chat = {
           out = await orchestrate({
             chain, lane: live ? run.lane : tlane, messages, images: run.images && run.images.length ? run.images : null, tools,
             executeTool: (call) => executeTool(call, ctx), signal, deadlineAt, emit,
-            profile: live ? "live" : null, maxIterations: live ? CONFIG.AGENT.LIVE_MAX_ITERATIONS : null, toolTimeoutMs: live ? CONFIG.TIMEOUTS.LIVE_TOOL_MS : null
+            profile: live ? "live" : null, maxIterations: live ? CONFIG.AGENT.LIVE_MAX_ITERATIONS : null, toolTimeoutMs: live ? CONFIG.TIMEOUTS.LIVE_TOOL_MS : null,
+            generationBudget
           });
           break;
         } catch (e) {
           if (signal.aborted || !(e instanceof ProviderError)) throw e;
           const left = deadlineAt - now();
-          const transient = !["auth", "model", "context", "client"].includes(e.kind);
-          if (transient && round < 8 && left > 25000) {
+          const transient = !["auth", "model", "context", "client", "attempts_exhausted", "operation_timeout", "timeout_total", "timeout_first", "timeout_idle"].includes(e.kind);
+          if (transient && round < 8 && left > 25000 && generationBudget.attempts < generationBudget.maxAttempts) {
             const waitMs = Math.min(30000, 2500 * 2 ** round, left - 20000);
             logger.warn({ runId: run.id, kind: e.kind, provider: e.provider, round: round + 1, waitMs }, "tous les modèles ont échoué (passager) → on patiente puis on relance");
             emit.status("waiting", { round: round + 1, reason: e.kind });
@@ -4390,7 +4483,7 @@ const chat = {
             continue;
           }
           logger.warn({ runId: run.id, kind: e.kind, provider: e.provider }, "orchestration échouée → réponse de secours");
-          out = await rescueAnswer({ messages, hasImages, signal, emit, cause: e });
+          out = await rescueAnswer({ messages, hasImages, signal, emit, cause: e, generationBudget, deadlineAt });
           break;
         }
       }
@@ -4405,7 +4498,7 @@ const chat = {
       };
       let fin = finalize(out);
       if (!fin.text && !out.rescued) {     // réponse vide : dernier passage de secours avant d'abandonner
-        out = await rescueAnswer({ messages, hasImages, signal, emit, cause: new ProviderError("empty", "réponse vide") });
+        out = await rescueAnswer({ messages, hasImages, signal, emit, cause: new ProviderError("empty", "réponse vide"), generationBudget, deadlineAt });
         fin = finalize(out);
       }
       let finalText = fin.text;
@@ -5387,7 +5480,8 @@ function buildApp() {
   // ----- Publiques -----
   app.get("/", (_req, res) => res.json({ name: "Luba AI Pro", version: CONFIG.VERSION, company: "HIKLON TECHNOLOGIES", status: "ok" }));
   app.get("/api/health", wrap(async (req, res) => {
-    const base = { status: runManager.draining ? "draining" : "ok", version: CONFIG.VERSION, uptimeS: Math.round(process.uptime()) };
+    // `status` = le SERVEUR (reste « ok » même si les fournisseurs LLM sont en panne : c'est ce que regarde Render) ; `llm` = fournisseurs externes.
+    const base = { status: runManager.draining ? "draining" : "ok", version: CONFIG.VERSION, uptimeS: Math.round(process.uptime()), llm: llmHealthSummary() };
     if (req.query.full && hasDebugAccess(req)) return res.json({ ...base, ...diagnostics(), db: await db.health() });
     return res.json(base);
   }));
@@ -5400,7 +5494,7 @@ function buildApp() {
     if (!metrics.enabled) throw Errors.notFound("METRICS_DISABLED", "Métriques désactivées (installe prom-client).");
     if (!hasDebugAccess(req) && !(CONFIG.METRICS_TOKEN && timingSafeStr(req.query.token || "", CONFIG.METRICS_TOKEN))) throw Errors.forbidden("FORBIDDEN", "Accès refusé.");
     res.setHeader("Content-Type", metrics.registry.contentType);
-    res.end(await metrics.registry.metrics);
+    res.end(await metrics.registry.metrics());
   }));
   app.get("/api/debug", wrap(async (req, res) => {
     if (!hasDebugAccess(req)) throw Errors.forbidden("FORBIDDEN", "Accès refusé.");
@@ -5480,7 +5574,7 @@ function buildApp() {
     const name = TOOL_ALIASES[asked] || asked;
     const args = req.body?.args || req.body?.params || req.body?.arguments || {};
     if (!getToolSchemas().some((s) => s.function.name === name)) throw Errors.badRequest("UNKNOWN_TOOL", "Outil inconnu.");
-    const out = await withTimeout(executeTool({ toolName: name, args }, { userId: req.userId, googleAccessToken: req.headers["x-google-access-token"] || null, convId: null, webRun: new WebRun() }), CONFIG.TIMEOUTS.TOOL_MS * 2, null, `outil ${name}`);
+    const out = await withTimeout(executeTool({ toolName: name, args }, { userId: req.userId, role: req.userRole, googleAccessToken: req.headers["x-google-access-token"] || null, convId: null, webRun: new WebRun() }), CONFIG.TIMEOUTS.TOOL_MS * 2, null, `outil ${name}`);
     res.json({ success: true, toolName: asked || name, ...out, reply: toolReplyText(out?.result) });
   }));
   app.post("/api/clear-cache", auth, rateLimit("API"), wrap(async (req, res) => {
@@ -5546,6 +5640,8 @@ function validateEnvironment() {
   logger.info({ providers: withKeys, fakeLlm: CONFIG.FAKE_LLM, node: process.version }, "environnement");
   if (freeSources) logger.info({ tools: freeSources.schemas().length, version: freeSources.VERSION }, "sources gratuites chargées (free-sources.js)");
   else if (fs.existsSync(path.join(__dirname, "free-sources.js")) && !envBool("DISABLE_FREE_SOURCES", false)) logger.warn("free-sources.js présent mais non chargeable (erreur de syntaxe ?)");
+  // [audit] piège de configuration : la base SQLite suit DB_PATH, PAS DATA_DIR. Un disque persistant monté via DATA_DIR ne la protège donc pas.
+  if (process.env.DATA_DIR && !process.env.DB_PATH && path.dirname(CONFIG.PATHS.DB) !== path.resolve(CONFIG.PATHS.DATA)) logger.warn({ DATA_DIR: CONFIG.PATHS.DATA, base_sqlite: CONFIG.PATHS.DB }, "DATA_DIR est défini mais pas DB_PATH : la base SQLite (historique) reste à son emplacement par défaut. Définir DB_PATH sur le disque persistant si tu veux la conserver entre redémarrages");
   if (lubaEngine) logger.info({ version: lubaEngine.VERSION }, "Luba Engine chargé (luba-engine.js)");   // [LUBA ENGINE]
   else if (fs.existsSync(path.join(__dirname, "luba-engine.js")) && !/^(0|false|no|off)$/i.test(process.env.ENGINE_ENABLED || "")) logger.warn("luba-engine.js présent mais non chargeable (erreur de syntaxe ?)");
 }
@@ -5587,7 +5683,9 @@ async function bootstrap({ listen = true } = {}) {
   timers.push(startLoadMonitor());
   if (!CONFIG.FAKE_LLM && envBool("STARTUP_LLM_CHECK", CONFIG.ENV !== "test")) {     // verdict immédiat dans les logs : quel modèle répond, lequel échoue et pourquoi
     setTimeout(() => diagnoseProviders().then((r) => {
-      for (const x of r) (x.ok ? logger.info : logger.error)(x, x.ok ? "auto-diagnostic LLM : OK" : "auto-diagnostic LLM : ÉCHEC");
+      // [FIX audit] Ne jamais détacher une méthode du logger (choisir logger.info ou logger.error dans un ternaire puis l'appeler) :
+      // pino lit `this` (Symbol(pino.msgPrefix)) ; la méthode détachée levait « Cannot read properties of undefined » et le résultat du diagnostic était perdu.
+      for (const x of r) { if (x.ok) logger.info(x, "auto-diagnostic LLM : OK"); else logger.error(x, "auto-diagnostic LLM : ÉCHEC"); }
       if (!r.length) logger.error("auto-diagnostic LLM : aucune clé de modèle configurée");
       else if (!r.some((x) => x.ok)) logger.error("auto-diagnostic LLM : AUCUN modèle ne répond → Luba ne pourra pas répondre (voir les lignes ÉCHEC ci-dessus)");
     }).catch((e) => logger.warn({ err: e.message }, "auto-diagnostic LLM impossible")), 1500).unref();
@@ -6566,11 +6664,16 @@ function initFirebase() {
     return;
   }
   try {
+    // [FIX audit] le cœur v18 a déjà créé l'app par défaut : un 2e initializeApp() sans nom lève « app/duplicate-app »
+    // (c'était l'erreur « Init Firebase Admin échouée » alors que Firebase fonctionnait). On réutilise l'instance existante.
+    if (typeof firebaseAdmin.credential?.cert !== "function") throw new Error("API namespacée de firebase-admin absente (version >= 14 ?)");
     const sa = parseFirebaseServiceAccount(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
-    firebaseApp = firebaseAdmin.initializeApp({
-      credential: firebaseAdmin.credential.cert(sa),
-      projectId: FIREBASE_CONFIG.projectId
-    });
+    firebaseApp = (firebaseAdmin.apps && firebaseAdmin.apps.length)
+      ? firebaseAdmin.app()
+      : firebaseAdmin.initializeApp({
+        credential: firebaseAdmin.credential.cert(sa),
+        projectId: FIREBASE_CONFIG.projectId
+      });
     if (Firestore) {
       firestoreDb = new Firestore.Firestore({
         projectId: FIREBASE_CONFIG.projectId,
@@ -15525,6 +15628,7 @@ function setupLubaLiveWebSocket(server) {
     });
 
     ws.on("close", () => {
+      cancelLiveRun(state, "ws_close");   // [audit] client parti : on n'alimente plus une génération que personne n'écoute
       liveSessions.delete(sid);
       if (metrics?.activeWebSockets) metrics.activeWebSockets.labels("live").dec();
     });
@@ -15566,6 +15670,7 @@ async function handleLiveFrame(ws, state, frame) {
 
   if (type === WS_FRAME.BARGE_IN) {
     state.interrupted = true;
+    cancelLiveRun(state, "barge_in");
     if (state.stt) state.stt.reset();
     ws.send(encodeFrame(WS_FRAME.STATUS, { stage: "barge_in" }));
     return;
@@ -15592,6 +15697,16 @@ async function handleLiveFrame(ws, state, frame) {
     }
     return;
   }
+}
+
+/** [audit] Annule la génération en cours d'une session vocale : plus personne n'écoute → on arrête de consommer du quota LLM. */
+function cancelLiveRun(state, why) {
+  const run = state.currentRun;
+  if (!run || run.isFinal) return false;
+  if (why === "ws_close" && process.env.LIVE_CANCEL_ON_CLOSE === "false") return false;
+  try { Promise.resolve(v17.cancelRun?.(run)).catch(() => {}); } catch {}
+  logger.info({ sessionId: state.sessionId, why }, "génération vocale annulée");
+  return true;
 }
 
 async function handleLiveTurn(ws, state, userText) {
@@ -15629,6 +15744,7 @@ async function handleLiveTurn(ws, state, userText) {
   try {
     const sseAdp = {
       closed: false,
+      onRun: (run) => { state.currentRun = run; },
       status: (stage, extra) => { if (ws.readyState === 1) ws.send(encodeFrame(WS_FRAME.STATUS, { stage, ...extra })); },
       reasoning: () => {},
       codeBlock: () => {},
@@ -15660,6 +15776,7 @@ async function handleLiveTurn(ws, state, userText) {
       sse: sseAdp
     });
 
+    state.currentRun = null;
     chunker.flush();
     // on attend la fin de la synthèse AVANT « DONE » : sinon l'audio arrive après et le navigateur parle en double
     for (let w = 0; (ttsQ.length || ttsRunning) && !state.interrupted && ws.readyState === 1 && w < 600; w++) await new Promise((r) => setTimeout(r, 40));
@@ -15669,6 +15786,7 @@ async function handleLiveTurn(ws, state, userText) {
       ws.send(encodeFrame(WS_FRAME.DONE, { conversationId: state.conversationId }));
     }
   } catch (e) {
+    state.currentRun = null;
     if (ws.readyState === 1) ws.send(encodeFrame(WS_FRAME.ERROR, { error: "Erreur de traitement" }));
   }
 }
@@ -15989,6 +16107,57 @@ if (require.main === module) {
 }
 
 // ================================================================================
+// §18 — MODULAR ADAPTERS (new modules; existing orchestrator remains authoritative)
+// ================================================================================
+function createLubaNetService(options = {}) {
+  const providers = options.providers || [
+    { name: "milo-search-web", search: async (query, opts = {}) => searchWeb(query, opts) },
+    { name: "milo-search-news", search: async (query, opts = {}) => searchNews(query, opts) },
+    { name: "milo-tavily", search: async (query, opts = {}) => searchTavily(query, { maxResults: opts.maxResults || 5, topic: opts.topic || "general" }) },
+    { name: "milo-serper", search: async (query, opts = {}) => searchSerper(query, { maxResults: opts.maxResults || 5, type: opts.topic === "news" ? "news" : "search" }) }
+  ];
+  return createLubaNet({ ...options, providers, openPage: options.openPage || (async (url, ctx = {}) => {
+    const out = await WEB_TOOLS.web_open.exec({ url }, { userId: ctx.userId || "luba-net-module", webRun: ctx.webRun });
+    if (!out?.success) throw Object.assign(new Error(out?.error || "Impossible d’ouvrir la page."), { code: "PAGE_OPEN_FAILED" });
+    return { url: out.url, title: out.title, text: out.text || out.excerpt || "" };
+  }) });
+}
+
+function createLubaLlmManager(options = {}) {
+  return createLlmManager({
+    ...options,
+    delegateToExistingOrchestrator: true,
+    getProviderState: options.getProviderState || ((provider) => ({ configured: Boolean(PROVIDERS[provider]?.keys?.length), enabled: true })),
+    generate: async (request) => {
+      const tier = request.tier === "v250" ? "v250" : "v100";
+      const chain = Array.isArray(request.chain) ? request.chain : tierChain(tier, { hasImages: Boolean(request.images?.length), code: Boolean(request.code) });
+      return callLLM({
+        chain, messages: request.messages || [], tools: request.tools || null, images: request.images || null,
+        lane: request.lane || (tier === "v250" ? "heavy" : "light"), signal: request.signal,
+        deadlineAt: request.deadlineAt, emit: request.emit || { status() {}, token() {}, reasoning() {} },
+        toolChoice: request.toolChoice || null, profile: request.profile || null, generationBudget: request.generationBudget || null
+      });
+    }
+  });
+}
+
+function createLubaCognitiveWorker(options = {}) {
+  const net = options.net || createLubaNetService(options.netOptions || {});
+  const llm = options.llm || createLubaLlmManager(options.llmOptions || {});
+  const engineModule = options.engine || lubaEngine;
+  const engine = engineModule?.engine || engineModule;
+  return createWorker({ ...options, dependencies: {
+    ...(options.dependencies || {}),
+    research: options.dependencies?.research || (async ({ input, signal }) => net.research(String(input?.query || input?.instruction || input || ""), { deep: true, signal })),
+    llm: options.dependencies?.llm || (async ({ input, signal, deadlineAt }) => llm.complete({ messages: [{ role: "user", content: typeof input === "string" ? input : safeJsonStringify(input) }], signal, deadlineAt, tier: input?.tier || "v100" })),
+    engine: options.dependencies?.engine || (async ({ input, signal }) => {
+      if (!engine || typeof engine.createTask !== "function") throw Object.assign(new Error("Luba Engine indisponible."), { code: "ENGINE_UNAVAILABLE" });
+      return engine.createTask({ userId: options.userId || "worker", role: options.role || "FREE", mode: input?.mode || "auto", instruction: input?.instruction || "", tier: input?.tier || "v100", input: input?.file || null, signal });
+    })
+  } });
+}
+
+// ================================================================================
 // §18 — EXPORTS & AUTO-START
 // ================================================================================
 
@@ -15996,8 +16165,8 @@ module.exports = {
   CONFIG, logger, AppError, Errors, bus, db, Database, repo, MIGRATIONS,
   TTLCache, TokenBucketLimiter, ThinkFilter, readSSE, makeWatchdog, fitContext, clipMiddle,
   ProviderHealth, ProviderError, health, KeyPool, PROVIDERS, TIERS, tierChain, classifyHttp,
-  lubaEngine, lubaEngineLlm,
-  callLLM, orchestrate, streamOpenAI, streamGemini, streamFake,
+  lubaEngine, lubaEngineLlm, llmHealthSummary,
+  callLLM, orchestrate, streamOpenAI, streamGemini, streamFake, createOperationBudget, remainingMs, tryConsumeGeneration,
   Run, RunManager, runManager, chat, stripInlineImages, SSEStream, SyncHub, syncHub, MirrorWorker, mirrorState,
   verifyToken, tokenCache, authenticate, buildApp, bootstrap, shutdown, diagnostics,
   formatFinalReply, cleanOutput, extractSuggestions, detectLanguage, quickIntent,
@@ -16007,7 +16176,8 @@ module.exports = {
   speakable, SpeechSanitizer, processUploads, docBlock, extractDocument, classifyUpload, buildHistory, refineIntent, parseLimitError, providerLimits, MEDIA_TOOLS, searchYoutubeVideos, searchTikTokVideos, searchOpenSERP, officialIcon, rescueAnswer, repairCodeFences, sourceList,
   executeTool, WEB_TOOLS, WebRun, mergeSources, htmlToPage, httpGet, isPrivateIp, assertPublicUrl, safeLookup, webSessions, webReply, setHttpGetForTest: (fn) => { httpGetImpl = fn || httpGet; },
   linkMedia, mirrorWorker, cloud, cloudMessageDoc, cloudSessionDoc, metaFromCloud, mirrorSessionDoc, enqueueSessionMirror,
-  setFirestoreForTest: (fs) => { firestoreDb = fs; mirrorState.firestore = Boolean(fs); hydratedUsers.clear(); hydratedConvs.clear(); }
+  setFirestoreForTest: (fs) => { firestoreDb = fs; mirrorState.firestore = Boolean(fs); hydratedUsers.clear(); hydratedConvs.clear(); },
+  createWorker, createLubaNet, createLlmManager, createLubaNetService, createLubaLlmManager, createLubaCognitiveWorker
 };
 
 if (require.main === module) {

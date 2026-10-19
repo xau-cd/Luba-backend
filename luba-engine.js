@@ -33,6 +33,7 @@ const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
+const { createOperationBudget } = require("./llm-operation-budget.js");
 
 const VERSION = "1.0.0";
 const PROTOCOL_VERSION = 1;
@@ -62,7 +63,7 @@ function buildConfig(o = {}) {
     maxConcurrent: pick("maxConcurrent", envInt("ENGINE_MAX_CONCURRENT", 1, 1, 8)),
     maxQueue: pick("maxQueue", envInt("ENGINE_MAX_QUEUE", 4, 0, 50)),
     stepTimeoutMs: pick("stepTimeoutMs", envInt("ENGINE_STEP_TIMEOUT_MS", 20000, 1000, 300000)),
-    taskTimeoutMs: pick("taskTimeoutMs", envInt("ENGINE_TASK_TIMEOUT_MS", 180000, 5000, 1800000)),
+    taskTimeoutMs: Math.min(5 * 60 * 1000, pick("taskTimeoutMs", envInt("ENGINE_TASK_TIMEOUT_MS", 180000, 5000, 1800000))),
     llmTimeoutMs: pick("llmTimeoutMs", envInt("ENGINE_LLM_TIMEOUT_MS", 90000, 5000, 600000)),
     maxOutputBytes: pick("maxOutputBytes", envInt("ENGINE_MAX_OUTPUT_KB", 256, 8, 4096) * 1024),
     maxRepair: pick("maxRepair", envInt("ENGINE_MAX_REPAIR", 2, 0, 5)),
@@ -76,6 +77,11 @@ function buildConfig(o = {}) {
     allowUnsandboxed: pick("allowUnsandboxed", envBool("ENGINE_ALLOW_UNSANDBOXED_EXEC", false)),
     execTimeoutMs: pick("execTimeoutMs", envInt("ENGINE_EXEC_TIMEOUT_MS", 10000, 500, 120000)),
     execMemMb: pick("execMemMb", envInt("ENGINE_EXEC_MEM_MB", 256, 32, 4096)),
+    execRoles: pick("execRoles", envStr("ENGINE_EXEC_ROLES", "ADMIN").split(",").map((x) => x.trim().toUpperCase()).filter(Boolean)),   // rôles autorisés à exécuter du code
+    exposeRunTool: pick("exposeRunTool", envBool("ENGINE_EXPOSE_RUN_TOOL", false)),    // opt-in explicite pour l'outil de chat engine_run_code
+    remoteUrl: pick("remoteUrl", envStr("ENGINE_REMOTE_EXEC_URL", "")),                // service d'exécution isolé EXTERNE (https)
+    remoteSecret: pick("remoteSecret", envStr("ENGINE_REMOTE_EXEC_SECRET", "")),       // secret HMAC partagé (jamais journalisé ni envoyé)
+    toolTimeoutMs: pick("toolTimeoutMs", envInt("ENGINE_TOOL_TIMEOUT_MS", 30000, 1000, 300000)),
     workerMemMb: pick("workerMemMb", envInt("ENGINE_WORKER_MEM_MB", 384, 64, 4096)),   // plafond mémoire du worker Python (Render Free : 512 Mo au total)
     cppStd: pick("cppStd", envStr("ENGINE_CPP_STD", "c++17"))
   });
@@ -410,6 +416,32 @@ function validatePlan(obj, { mode, fileExists, cfg }) {
   return { diagnosis, notes, needFiles, plan };
 }
 
+/**
+ * Validation d'arguments d'outil contre le schéma JSON annoncé au LLM (sous-ensemble : type, required, enum, minLength/maxLength,
+ * additionalProperties:false). Le LLM peut produire n'importe quoi : aucun outil n'exécute d'argument non validé.
+ */
+function validateArgs(schema, args) {
+  const errors = [];
+  const props = schema?.properties || {};
+  if (args === null || typeof args !== "object" || Array.isArray(args)) return ["arguments : objet attendu"];
+  for (const k of schema?.required || []) if (args[k] === undefined || args[k] === null) errors.push(`« ${k} » est requis`);
+  for (const [k, v] of Object.entries(args)) {
+    const d = props[k];
+    if (!d) { if (schema?.additionalProperties === false) errors.push(`« ${k} » n'est pas un argument connu`); continue; }
+    const t = d.type;
+    if (t === "string" && typeof v !== "string") { errors.push(`« ${k} » doit être un texte`); continue; }
+    if (t === "number" && typeof v !== "number") { errors.push(`« ${k} » doit être un nombre`); continue; }
+    if (t === "integer" && !Number.isInteger(v)) { errors.push(`« ${k} » doit être un entier`); continue; }
+    if (t === "boolean" && typeof v !== "boolean") { errors.push(`« ${k} » doit être un booléen`); continue; }
+    if (typeof v === "string") {
+      if (d.maxLength !== undefined && v.length > d.maxLength) errors.push(`« ${k} » dépasse ${d.maxLength} caractères`);
+      if (d.minLength !== undefined && v.length < d.minLength) errors.push(`« ${k} » est trop court`);
+    }
+    if (d.enum && !d.enum.includes(v)) errors.push(`« ${k} » doit valoir l'une des valeurs : ${d.enum.join(", ")}`);
+  }
+  return errors;
+}
+
 /** Classification déterministe de la demande : on ne lance pas d'outils lourds ni le LLM quand une analyse locale suffit. */
 function classify(mode, instruction, hasInput) {
   let m = ["analyze", "fix", "create"].includes(mode) ? mode : "auto", reason = "demandé explicitement";
@@ -471,22 +503,36 @@ function createEngine(options = {}) {
         const exe = findExe(n);
         if (!exe) continue;
         const r = await runProcess(exe, ["--version"], { cwd: os.tmpdir(), timeoutMs: 5000 });
-        if (r.code === 0) { caps.compilers[key] = { available: true, path: exe, version: r.stdout.split("\n")[0].trim() }; break; }
+        if (r.code === 0) {
+          // détecté ≠ exécutable : on compile réellement un programme trivial (entrée standard, aucun fichier) pour savoir si l'outil FONCTIONNE ici
+          const lang = key === "gxx" ? "c++" : "c";
+          const t = await runProcess(exe, ["-fsyntax-only", "-x", lang, "-"], { cwd: os.tmpdir(), timeoutMs: 15000, input: "int main(void){return 0;}\n" });
+          caps.compilers[key] = { available: true, path: exe, version: r.stdout.split("\n")[0].trim(), tested: t.code === 0, testDetail: t.code === 0 ? null : clip((t.stderr || `code ${t.code}`).trim(), 160) };
+          break;
+        }
       }
       if (!caps.compilers[key]) caps.compilers[key] = { available: false };
     }
+    // Diagnostic : on garde la RAISON de chaque échec (sinon « isolation: null » reste inexplicable sur l'hébergeur).
+    const attempts = [];
     const bwrap = findExe("bwrap");
-    if (bwrap) {
+    if (!bwrap) attempts.push({ method: "bwrap", ok: false, reason: "binaire bwrap absent du PATH" });
+    else {
       const r = await runProcess(bwrap, ["--unshare-all", "--die-with-parent", "--ro-bind", "/", "/", "true"], { cwd: os.tmpdir(), timeoutMs: 5000 });
+      attempts.push({ method: "bwrap", ok: r.code === 0, reason: r.code === 0 ? null : clip((r.stderr || `code ${r.code}`).trim(), 200) });
       if (r.code === 0) caps.isolation = { method: "bwrap", strong: true, path: bwrap, detail: "système de fichiers + réseau + processus isolés" };
     }
     if (!caps.isolation.method) {
       const unshare = findExe("unshare");
-      if (unshare) {
+      if (!unshare) attempts.push({ method: "unshare", ok: false, reason: "binaire unshare absent du PATH" });
+      else {
         const r = await runProcess(unshare, ["-r", "-n", "-p", "-f", "--mount-proc", "--kill-child", "--", "true"], { cwd: os.tmpdir(), timeoutMs: 5000 });
+        attempts.push({ method: "unshare", ok: r.code === 0, reason: r.code === 0 ? null : clip((r.stderr || `code ${r.code}`).trim(), 200) });
         if (r.code === 0) caps.isolation = { method: "unshare", strong: false, path: unshare, detail: "réseau + processus isolés ; PAS d'isolation du système de fichiers (insuffisant pour du code non fiable)" };
       }
     }
+    caps.isolation.probe = attempts;
+    caps.remoteExec = { configured: Boolean(cfg.remoteUrl && cfg.remoteSecret) };
     state.caps = caps;
     if (caps.python.available) {
       try { caps.worker = (await callWorker("capabilities", {}, { root: os.tmpdir() })).result; } catch (e) { caps.worker = { error: e.code || "WORKER_ERROR", message: e.message }; caps.python.available = false; }
@@ -494,13 +540,51 @@ function createEngine(options = {}) {
     return caps;
   }
 
+  const remoteConfigured = () => Boolean(cfg.remoteUrl && cfg.remoteSecret);
+  /** Qui peut exécuter quoi, et où. Toute branche « refusée » dit POURQUOI (pour les journaux et l'API de capacités). */
   const execPolicy = (role) => {
     const c = state.caps?.isolation || {};
     if (!cfg.allowExec) return { allowed: false, code: "EXECUTION_DISABLED", reason: "L'exécution de code est désactivée sur ce serveur (ENGINE_ALLOW_EXEC=false)." };
+    const r = String(role || "FREE").toUpperCase();
+    if (!cfg.execRoles.includes(r)) return { allowed: false, code: "FORBIDDEN_ROLE", reason: `L'exécution de code est réservée aux rôles : ${cfg.execRoles.join(", ")}.` };
     if (c.strong) return { allowed: true, mode: "sandbox", isolation: c.method };
-    if (cfg.allowUnsandboxed && role === "ADMIN") return { allowed: true, mode: "unsandboxed", isolation: c.method === "unshare" ? "unshare" : null, warning: "Exécution SANS isolation du système de fichiers (dérogation administrateur explicite)." };
-    return { allowed: false, code: "ISOLATION_REQUIRED", reason: "Aucune isolation forte (bwrap) n'est disponible : l'exécution de code non fiable est refusée." };
+    if (remoteConfigured()) return { allowed: true, mode: "remote", isolation: null, warning: "Exécution déléguée à un service distant : son isolation n'est pas vérifiable depuis ce serveur." };
+    if (cfg.allowUnsandboxed && r === "ADMIN") return { allowed: true, mode: "unsandboxed", isolation: c.method === "unshare" ? "unshare" : null, warning: "Exécution SANS isolation du système de fichiers (dérogation administrateur explicite)." };
+    const why = (c.probe || []).filter((a) => !a.ok).map((a) => `${a.method}: ${a.reason}`).join(" | ");
+    return { allowed: false, code: "ISOLATION_REQUIRED", reason: `Aucune isolation forte n'est disponible : l'exécution de code non fiable est refusée.${why ? ` (sondes : ${why})` : ""} Option réaliste : service d'exécution distant (ENGINE_REMOTE_EXEC_URL).` };
   };
+
+  // ----- exécution déléguée à un service ISOLÉ externe : requête et réponse signées (HMAC-SHA256), https obligatoire -----
+  const hmac = (secret, data) => crypto.createHmac("sha256", secret).update(data).digest("hex");
+  const safeEq = (a, b) => { const x = Buffer.from(String(a)), y = Buffer.from(String(b)); return x.length === y.length && crypto.timingSafeEqual(x, y); };
+  async function remoteExec({ language, code, stdin = "", signal = null }) {
+    let url;
+    try { url = new URL(cfg.remoteUrl); } catch { throw new EngineError("REMOTE_CONFIG", "ENGINE_REMOTE_EXEC_URL invalide.", { status: 500 }); }
+    const local = ["localhost", "127.0.0.1", "::1", "[::1]"].includes(url.hostname);
+    if (url.protocol !== "https:" && !local) throw new EngineError("REMOTE_INSECURE", "Le service d'exécution distant doit utiliser https.", { status: 500 });
+    const body = JSON.stringify({ v: PROTOCOL_VERSION, id: crypto.randomBytes(6).toString("hex"), language, code, stdin: String(stdin || "").slice(0, 64 * 1024), limits: { timeout_ms: cfg.execTimeoutMs, mem_mb: cfg.execMemMb, output_bytes: cfg.maxOutputBytes } });
+    const ts = String(Math.floor(Date.now() / 1000)), nonce = crypto.randomBytes(12).toString("hex");
+    const sig = hmac(cfg.remoteSecret, `${ts}.${nonce}.${sha256(body)}`);
+    const timeout = AbortSignal.timeout(cfg.execTimeoutMs + 5000);
+    const t0 = now();
+    let res, text;
+    try {
+      res = await fetch(url, { method: "POST", redirect: "error", headers: { "Content-Type": "application/json", "X-Luba-Timestamp": ts, "X-Luba-Nonce": nonce, "X-Luba-Signature": sig }, body, signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
+      const declared = parseInt(res.headers.get("content-length") || "0", 10);
+      if (declared > cfg.maxOutputBytes * 4) throw new EngineError("REMOTE_TOO_LARGE", "Réponse du service distant trop volumineuse.", { status: 502 });
+      text = await res.text();
+    } catch (e) {
+      if (e instanceof EngineError) throw e;
+      if (signal?.aborted) throw new EngineError("CANCELLED", "Tâche annulée.", { status: 499 });
+      throw new EngineError("REMOTE_UNAVAILABLE", timeout.aborted ? "Le service d'exécution distant n'a pas répondu à temps." : "Le service d'exécution distant est injoignable.", { status: 503, retryable: true });
+    }
+    if (text.length > cfg.maxOutputBytes * 4) throw new EngineError("REMOTE_TOO_LARGE", "Réponse du service distant trop volumineuse.", { status: 502 });
+    if (!res.ok) throw new EngineError("REMOTE_REFUSED", `Le service d'exécution distant a refusé la demande (HTTP ${res.status}).`, { status: 502 });
+    if (!safeEq(res.headers.get("x-luba-signature") || "", hmac(cfg.remoteSecret, `${ts}.${nonce}.${sha256(text)}`))) throw new EngineError("REMOTE_BAD_SIGNATURE", "Réponse du service distant non authentifiée : résultat rejeté.", { status: 502 });
+    let j; try { j = JSON.parse(text); } catch { throw new EngineError("REMOTE_BAD_RESPONSE", "Réponse du service distant illisible.", { status: 502 }); }
+    if (typeof j !== "object" || j === null || typeof j.stdout !== "string" || typeof j.stderr !== "string" || !(Number.isInteger(j.exitCode) || j.exitCode === null)) throw new EngineError("REMOTE_BAD_RESPONSE", "Réponse du service distant invalide.", { status: 502 });
+    return { exitCode: j.exitCode, stdout: clip(j.stdout, cfg.maxOutputBytes), stderr: clip(j.stderr, 8000), timedOut: Boolean(j.timedOut), outputTruncated: Boolean(j.outputTruncated) || j.stdout.length > cfg.maxOutputBytes, durationMs: now() - t0, isolation: "remote", remoteReportedIsolation: typeof j.isolation === "string" ? clip(j.isolation, 60) : null, warning: "Exécution déléguée à un service distant : son isolation n'est pas vérifiable depuis ce serveur." };
+  }
 
   // ----- appel du worker Python (protocole JSON v1) -----
   async function callWorker(op, args, { root, timeoutMs = cfg.stepTimeoutMs, signal = null } = {}) {
@@ -547,6 +631,7 @@ function createEngine(options = {}) {
         const full = path.join(root, rel);
         const nc = buildCommand({ exe: process.execPath, args: ["--check", full], cwd: root, limits: { cpuS: 15, fsizeBytes: 8 * MB }, prlimitPath: state.caps?.prlimit });
         const r = await runProcess(nc.cmd, nc.args, { cwd: root, timeoutMs: budget(), maxOutput: 64 * 1024, signal });
+        if (r.aborted || signal?.aborted) throw new EngineError("CANCELLED", "Vérification annulée.", { status: 499 });
         if (r.code === 0) results.push(norm(rel, language, "passed", "node --check", { detail: "analyse syntaxique seulement (le code n'est pas exécuté)" }));
         else if (/SyntaxError/.test(r.stderr)) {
           const m = r.stderr.match(/:(\d+)\n/);
@@ -557,13 +642,14 @@ function createEngine(options = {}) {
       } else if (language === "c" || language === "cpp") {
         if (path.extname(rel).toLowerCase() === ".h" || /\.(hpp|hh)$/i.test(rel)) { results.push(norm(rel, language, "skipped", null, { detail: "en-tête : vérifié à travers les fichiers sources qui l'incluent" })); continue; }
         const comp = language === "cpp" ? state.caps?.compilers?.gxx : state.caps?.compilers?.gcc;
-        if (!comp?.available) { results.push(norm(rel, language, "unavailable", null, { detail: `compilateur ${language === "cpp" ? "g++" : "gcc"} indisponible : aucune compilation effectuée` })); continue; }
+        if (!comp?.available || comp.tested === false) { results.push(norm(rel, language, "unavailable", null, { detail: `compilateur ${language === "cpp" ? "g++" : "gcc"} ${comp?.available ? "détecté mais auto-test en échec" : "indisponible"} : aucune compilation effectuée` })); continue; }
         let text;
         try { text = fs.readFileSync(path.join(root, rel), "utf8"); } catch { results.push(norm(rel, language, "skipped", null, { detail: "fichier illisible" })); continue; }
         const bad = scanCppIncludes(text);
         if (bad.length) { results.push(norm(rel, language, "refused", "scan des inclusions", { errors: bad.map((m) => ({ line: null, col: null, message: m })), detail: "refusé avant compilation par prudence" })); continue; }
         const c = buildCommand({ exe: comp.path, args: ["-fsyntax-only", "-Wall", "-Wextra", ...(language === "cpp" ? [`-std=${cfg.cppStd}`] : ["-std=c11"]), "-I", root, path.join(root, rel)], cwd: root, limits: { cpuS: 15, fsizeBytes: 8 * MB }, prlimitPath: state.caps?.prlimit });
         const r = await runProcess(c.cmd, c.args, { cwd: root, timeoutMs: budget(), maxOutput: 128 * 1024, signal });
+        if (r.aborted || signal?.aborted) throw new EngineError("CANCELLED", "Vérification annulée.", { status: 499 });
         const diag = parseCompilerDiagnostics(r.stderr, rel);
         if (r.timedOut) results.push(norm(rel, language, "skipped", comp.path, { detail: "délai de compilation dépassé" }));
         else if (r.code === 0) results.push(norm(rel, language, "passed", `${path.basename(comp.path)} -fsyntax-only`, { warnings: diag.warnings, detail: "syntaxe/typage vérifiés ; le programme n'est pas compilé en binaire ni exécuté" }));
@@ -608,6 +694,10 @@ function createEngine(options = {}) {
     const lang = LANG_ALIASES[String(language || "").toLowerCase()];
     if (!["python", "javascript", "c", "cpp"].includes(lang)) throw new EngineError("UNSUPPORTED_LANGUAGE", "Langage non exécutable (python, javascript, c, cpp).");
     if (typeof code !== "string" || !code.trim() || Buffer.byteLength(code) > cfg.maxWriteBytes) throw new EngineError("BAD_INPUT", "Code vide ou trop volumineux.");
+    if (policy.mode === "remote") {
+      const rel = await acquire();
+      try { return { ...(await remoteExec({ language: lang, code, stdin, signal })), mode: "remote" }; } finally { rel(); }
+    }
     const release = await acquire();
     const dir = path.join(base(), newTaskId("scr"));
     try {
@@ -625,11 +715,15 @@ function createEngine(options = {}) {
         if (bad.length) throw new EngineError("UNSAFE_SOURCE", `Code refusé : ${bad[0]}.`);
         const cc = buildCommand({ exe: comp.path, args: ["-O0", ...(lang === "cpp" ? [`-std=${cfg.cppStd}`] : ["-std=c11"]), "-o", "prog", file], cwd: dir, limits: { cpuS: 20, fsizeBytes: 16 * MB }, prlimitPath: state.caps.prlimit });
         const cr = await runProcess(cc.cmd, cc.args, { cwd: dir, timeoutMs: Math.max(cfg.stepTimeoutMs, 15000), maxOutput: 64 * 1024, signal });
+        if (cr.aborted) throw new EngineError("CANCELLED", "Exécution annulée.", { status: 499 });
+        if (cr.timedOut) throw new EngineError("EXEC_TIMEOUT", "La compilation a dépassé le délai autorisé.", { status: 504 });
         if (cr.code !== 0) return { compiled: false, exitCode: null, stdout: "", stderr: clip(cr.stderr, 4000), diagnostics: parseCompilerDiagnostics(cr.stderr, file), isolation: policy.mode, timedOut: cr.timedOut };
         exe = "./prog"; args = []; lim.asBytes = cfg.execMemMb * MB;
       }
       const c = buildCommand({ exe, args, cwd: dir, limits: lim, prlimitPath: state.caps.prlimit, isolation: policy.isolation, bwrapPath: state.caps.isolation.path, unsharePath: state.caps.isolation.path });
       const r = await runProcess(c.cmd, c.args, { cwd: dir, timeoutMs: cfg.execTimeoutMs, maxOutput: cfg.maxOutputBytes, input: String(stdin || "").slice(0, 64 * 1024), signal });
+      if (r.aborted || signal?.aborted) throw new EngineError("CANCELLED", "Exécution annulée.", { status: 499 });
+      if (r.timedOut) throw new EngineError("EXEC_TIMEOUT", "Le programme a dépassé le délai autorisé et a été interrompu.", { status: 504 });
       return { compiled: lang === "c" || lang === "cpp" ? true : undefined, exitCode: r.code, signal: r.signal, stdout: r.stdout, stderr: clip(r.stderr, 8000), timedOut: r.timedOut, outputTruncated: r.truncated, durationMs: r.durationMs, isolation: policy.mode, warning: policy.warning || null, spawnError: r.spawnError };
     } finally { release(); try { removeDir(dir, base()); } catch { /* nettoyage au prochain balayage */ } }
   }
@@ -698,12 +792,15 @@ function createEngine(options = {}) {
   // ----- consultation du cerveau (bornée) -----
   async function askBrain(task, messages, deadline, signal) {
     if (!state.llm) throw new EngineError("LLM_UNAVAILABLE", "Le modèle n'est pas relié au moteur : impossible de proposer un correctif.", { status: 503 });
+    deadline = Math.min(deadline, task.generationBudget?.deadlineAt ?? deadline);
     const left = deadline - now();
     if (left < 1500) throw new EngineError("TASK_TIMEOUT", "Budget de temps épuisé avant la consultation du modèle.", { status: 504 });
     let r;
-    try { r = await state.llm({ messages, tier: task.tier, signal, timeoutMs: Math.min(cfg.llmTimeoutMs, left - 1000) }); }
+    try { r = await state.llm({ messages, tier: task.tier, signal, timeoutMs: Math.min(cfg.llmTimeoutMs, left - 1000), generationBudget: task.generationBudget, deadlineAt: deadline }); }
     catch (e) {
       if (signal?.aborted) throw task.cancelled ? new EngineError("CANCELLED", "Tâche annulée.", { status: 499 }) : new EngineError("TASK_TIMEOUT", "Budget de temps de la tâche épuisé pendant la consultation du modèle.", { status: 504 });
+      if (e?.kind === "attempts_exhausted" || e?.code === "LLM_ATTEMPTS_EXHAUSTED") throw new EngineError("LLM_ATTEMPTS_EXHAUSTED", "La limite globale de générations du modèle est atteinte pour cette tâche.", { status: 503, retryable: false });
+      if (e?.kind === "operation_timeout" || e?.code === "OPERATION_TIMEOUT") throw new EngineError("TASK_TIMEOUT", "La tâche a dépassé le délai maximal autorisé.", { status: 504, retryable: false });
       throw new EngineError("LLM_FAILED", "Le modèle n'a pas pu répondre pour le moment.", { status: 503, retryable: true });
     }
     task.llm.calls++;
@@ -765,9 +862,12 @@ function createEngine(options = {}) {
 
   async function runPipeline(task) {
     const root = taskDir(task.id), work = path.join(root, "work"), original = path.join(root, "original"), outDir = path.join(root, "out");
-    const signal = task.abort.signal, deadline = task.startedAt + cfg.taskTimeoutMs;
-    const timer = setTimeout(() => task.abort.abort(), cfg.taskTimeoutMs);
-    const guard = () => { if (signal.aborted) throw new EngineError(task.cancelled ? "CANCELLED" : "TASK_TIMEOUT", task.cancelled ? "Tâche annulée." : "Budget de temps de la tâche épuisé.", { status: task.cancelled ? 499 : 504 }); };
+    const signal = task.abort.signal;
+    task.generationBudget = createOperationBudget({ startedAt: task.startedAt, deadlineAt: task.startedAt + cfg.taskTimeoutMs });
+    const deadline = task.generationBudget.deadlineAt;
+    const timeoutMs = Math.max(0, deadline - now());
+    const timer = setTimeout(() => task.abort.abort(), timeoutMs);
+    const guard = () => { if (signal.aborted || now() >= deadline) throw new EngineError(task.cancelled ? "CANCELLED" : "TASK_TIMEOUT", task.cancelled ? "Tâche annulée." : "Budget de temps de la tâche épuisé.", { status: task.cancelled ? 499 : 504 }); };
     try {
       const cls = await step(task, "classification", async () => classify(task.mode, task.instruction, task.hasInput));
       task.mode = cls.mode; task.classification = cls;
@@ -999,41 +1099,48 @@ function createEngine(options = {}) {
   // ---------------------------------------------------------------------------------------------
   const capsSummary = (admin = false) => {
     const c = state.caps || {};
-    const exec = execPolicy(admin ? "ADMIN" : null);
+    const exec = execPolicy(admin ? "ADMIN" : null);        // ce que PEUT faire le lecteur
+    const execCfg = execPolicy("ADMIN");                      // comment l'exécution est configurée sur ce serveur
     const out = {
       engine: c.engine, python: c.python?.available ? { available: true, version: c.python.version } : { available: false },
-      node: c.node, compilers: { "g++": c.compilers?.gxx?.available ? { available: true, version: c.compilers.gxx.version } : { available: false }, gcc: c.compilers?.gcc?.available ? { available: true, version: c.compilers.gcc.version } : { available: false } },
+      node: c.node, compilers: { "g++": c.compilers?.gxx?.available ? { detected: true, version: c.compilers.gxx.version, tested: Boolean(c.compilers.gxx.tested), test_detail: c.compilers.gxx.testDetail || null } : { detected: false }, gcc: c.compilers?.gcc?.available ? { detected: true, version: c.compilers.gcc.version, tested: Boolean(c.compilers.gcc.tested), test_detail: c.compilers.gcc.testDetail || null } : { detected: false } },
       resource_limits: Boolean(c.prlimit), isolation: { method: c.isolation?.method || null, strong: Boolean(c.isolation?.strong), detail: c.isolation?.detail || "aucune isolation disponible" },
-      execution: exec.allowed ? { allowed: true, mode: exec.mode, warning: exec.warning || null } : { allowed: false, reason: exec.reason },
+      execution: { allowed: exec.allowed, mode: execCfg.allowed ? execCfg.mode : null, code: exec.allowed ? null : exec.code, reason: exec.allowed ? null : exec.reason, warning: execCfg.warning || null },
+      remote_exec: { configured: remoteConfigured(), requires_https: true, authenticated: "HMAC-SHA256" },
+      exec_roles: cfg.execRoles, run_tool_exposed_to_chat: runToolExposable(),
       formats: c.worker?.formats || { note: "worker Python indisponible : formats complexes (ZIP, DOCX, PDF, XLSX…) non pris en charge" },
       worker: c.worker?.worker_version ? { version: c.worker.worker_version, python: c.worker.python, modules: c.worker.modules } : (c.worker || null),
       limits: { upload_mb: cfg.maxUploadBytes / MB, unpacked_mb: cfg.maxUnpackedBytes / MB, max_files: cfg.maxFiles, task_timeout_s: cfg.taskTimeoutMs / 1000, concurrent: cfg.maxConcurrent, ttl_min: cfg.taskTtlMs / 60000 },
       persistence: "disque local éphémère (Render Free : perdu au redémarrage) — brancher options.storage / onTaskFinished pour un stockage durable"
     };
-    if (admin) { out.python_path = c.python?.path || null; out.prlimit = c.prlimit || null; }
+    if (admin) { out.python_path = c.python?.path || null; out.prlimit = c.prlimit || null; out.isolation.probe = c.isolation?.probe || []; }
     return out;
   };
 
   const TOOLS = {
     engine_check_code: {
-      schema: { type: "function", function: { name: "engine_check_code", description: "VÉRIFIE réellement un extrait de code (syntaxe, et compilation « syntaxe seule » pour C/C++) avec les outils du serveur, sans l'exécuter. À utiliser pour contrôler du code avant de le présenter comme correct. Renvoie les erreurs ligne par ligne et indique les contrôles non réalisés.", parameters: { type: "object", properties: { language: { type: "string", description: "python, javascript, json, yaml, xml, html, css, c, cpp" }, code: { type: "string", description: "Le code à contrôler" } }, required: ["language", "code"] } } },
-      async exec(args) { return checkCode(args); }
+      schema: { type: "function", function: { name: "engine_check_code", description: "VÉRIFIE réellement un extrait de code (syntaxe, et compilation « syntaxe seule » pour C/C++) avec les outils du serveur, sans l'exécuter. À utiliser pour contrôler du code avant de le présenter comme correct. Renvoie les erreurs ligne par ligne et indique les contrôles non réalisés.", parameters: { type: "object", properties: { language: { type: "string", description: "python, javascript, json, yaml, xml, html, css, c, cpp", maxLength: 20 }, code: { type: "string", description: "Le code à contrôler", minLength: 1, maxLength: 200000 } }, required: ["language", "code"], additionalProperties: false } } },
+      permissions: ["compute:local-readonly"], timeoutMs: 60000,
+      async exec(args, ctx) { return checkCode(args, { signal: ctx?.signal || null }); }
     },
     engine_capabilities: {
-      schema: { type: "function", function: { name: "engine_capabilities", description: "Liste ce que Luba Engine peut RÉELLEMENT faire sur ce serveur (formats, compilateurs, exécution, limites). À consulter avant de promettre une opération sur des fichiers.", parameters: { type: "object", properties: {}, required: [] } } },
+      schema: { type: "function", function: { name: "engine_capabilities", description: "Liste ce que Luba Engine peut RÉELLEMENT faire sur ce serveur (formats, compilateurs, exécution, limites). À consulter avant de promettre une opération sur des fichiers.", parameters: { type: "object", properties: {}, required: [], additionalProperties: false } } },
+      permissions: ["info:capabilities"], timeoutMs: 5000,
       async exec() { return { success: true, ...capsSummary(false) }; }
     },
     engine_run_code: {
-      schema: { type: "function", function: { name: "engine_run_code", description: "Exécute un petit programme dans un bac à sable isolé (sans réseau, délai et mémoire limités) et renvoie sa vraie sortie. Langages : python, javascript, c, cpp.", parameters: { type: "object", properties: { language: { type: "string" }, code: { type: "string" }, stdin: { type: "string", description: "Entrée standard facultative" } }, required: ["language", "code"] } } },
+      schema: { type: "function", function: { name: "engine_run_code", description: "Exécute un petit programme dans un bac à sable isolé (sans réseau, délai et mémoire limités) et renvoie sa vraie sortie. Langages : python, javascript, c, cpp.", parameters: { type: "object", properties: { language: { type: "string", enum: ["python", "javascript", "c", "cpp"] }, code: { type: "string", minLength: 1, maxLength: 200000 }, stdin: { type: "string", description: "Entrée standard facultative", maxLength: 65536 } }, required: ["language", "code"], additionalProperties: false } } },
+      permissions: ["exec:isolated"], timeoutMs: 45000,
       async exec(args, ctx) {
-        try { const r = await execCode({ language: args.language, code: args.code, stdin: args.stdin, role: null }); return { success: true, ...r, note: "Sortie réelle du programme exécuté dans le bac à sable." }; }
+        try { const r = await execCode({ language: args.language, code: args.code, stdin: args.stdin, role: ctx?.role || null, signal: ctx?.signal || null }); return { success: true, ...r, note: "Sortie réelle du programme exécuté dans le bac à sable." }; }
         catch (e) { return { success: false, code: e.code || "ENGINE_ERROR", error: e instanceof EngineError ? e.message : "Exécution impossible." }; }
       }
     }
   };
 
-  async function checkCode({ language, code }) {
+  async function checkCode({ language, code }, { signal = null } = {}) {
     if (!state.ready) return { success: false, error: "Luba Engine n'est pas disponible." };
+    if (signal?.aborted) return { success: false, code: "CANCELLED", error: "Vérification annulée." };
     const lang = LANG_ALIASES[String(language || "").toLowerCase()];
     if (!lang) return { success: false, error: "Langage non pris en charge pour la vérification.", supported: Object.keys(LANG_EXT) };
     if (typeof code !== "string" || !code.trim()) return { success: false, error: "Code vide." };
@@ -1045,7 +1152,7 @@ function createEngine(options = {}) {
       fs.mkdirSync(dir, { recursive: true });
       const file = `snippet${LANG_EXT[lang]}`;
       fs.writeFileSync(path.join(dir, file), code);
-      const checks = await verifyFiles(dir, [file], { deadline: now() + cfg.stepTimeoutMs });
+      const checks = await verifyFiles(dir, [file], { deadline: now() + cfg.stepTimeoutMs, signal });
       const c = checks[0] || norm(file, lang, "skipped", null, { detail: "aucun contrôle disponible" });
       const verdict = c.status === "passed" ? "valide (contrôle réel passé)" : c.status === "failed" ? "erreurs détectées" : `non vérifié (${c.status})`;
       return { success: true, language: lang, verdict, status: c.status, tool: c.tool, errors: c.errors.slice(0, 15), warnings: c.warnings.slice(0, 10), detail: c.detail, note: "Contrôle statique : il ne prouve ni le bon fonctionnement ni l'absence de vulnérabilité ; le code n'a PAS été exécuté." };
@@ -1053,13 +1160,60 @@ function createEngine(options = {}) {
     finally { release(); try { removeDir(dir, base()); } catch { /* balayage ultérieur */ } }
   }
 
-  const isToolAvailable = (name) => state.ready && (name !== "engine_run_code" || Boolean(execPolicy(null).allowed && execPolicy(null).mode === "sandbox"));
+  // engine_run_code n'est annoncé au LLM que si : opt-in explicite (ENGINE_EXPOSE_RUN_TOOL) ET exécution autorisée ET isolation forte (bwrap) ou service distant authentifié.
+  // Un rôle autorisé est de toute façon revérifié à CHAQUE appel (ctx.role). La dérogation « sans isolation » n'expose JAMAIS l'outil au chat.
+  const runToolExposable = () => { const c = state.caps?.isolation || {}; return cfg.exposeRunTool && cfg.allowExec && (Boolean(c.strong) || remoteConfigured()); };
+  const isToolAvailable = (name) => state.ready && (name !== "engine_run_code" || runToolExposable());
   const schemas = () => (state.ready ? Object.entries(TOOLS).filter(([n]) => isToolAvailable(n)).map(([, t]) => t.schema) : []);
   const has = (name) => Boolean(TOOLS[name]) && isToolAvailable(name);
+  /** Exécution d'un outil : arguments validés, délai borné, résultat normalisé { success, …, meta:{ tool, durationMs, permissions } }. Ne lève jamais. */
   async function execute(name, args, ctx) {
-    if (!has(name)) return { result: { success: false, error: "Outil indisponible" }, sourceKeys: [] };
-    try { return { result: await TOOLS[name].exec(args || {}, ctx || {}), sourceKeys: [] }; }
-    catch (e) { log("error", { err: e?.message, tool: name }, "luba-engine : outil en échec"); return { result: { success: false, error: "Erreur interne du moteur." }, sourceKeys: [] }; }
+    if (!has(name)) return { result: { success: false, code: "TOOL_UNAVAILABLE", error: "Outil indisponible" }, sourceKeys: [] };
+    const tool = TOOLS[name];
+    const t0 = now();
+    const meta = (extra = {}) => ({ tool: name, durationMs: now() - t0, permissions: tool.permissions || [], timeoutMs: tool.timeoutMs || cfg.toolTimeoutMs, ...extra });
+    const errs = validateArgs(tool.schema.function.parameters, args === undefined ? {} : args);
+    if (errs.length) return { result: { success: false, code: "INVALID_ARGUMENTS", error: `Arguments invalides : ${errs.slice(0, 5).join(" ; ")}`, meta: meta() }, sourceKeys: [] };
+    let timer, timedOut = false, onParentAbort, onToolAbort;
+    const controller = new AbortController();
+    try {
+      const limit = Math.min(tool.timeoutMs || cfg.toolTimeoutMs, cfg.toolTimeoutMs);   // ENGINE_TOOL_TIMEOUT_MS plafonne tous les outils
+      const parentSignal = ctx?.signal;
+      if (parentSignal?.aborted) throw new EngineError("CANCELLED", "Appel d'outil annulé.", { status: 499 });
+      else if (parentSignal) {
+        onParentAbort = () => controller.abort(parentSignal.reason);
+        parentSignal.addEventListener("abort", onParentAbort, { once: true });
+      }
+      const cancellation = new Promise((_, rej) => {
+        onToolAbort = () => {
+          if (!timedOut) rej(new EngineError("CANCELLED", "Appel d'outil annulé.", { status: 499 }));
+        };
+        if (controller.signal.aborted) onToolAbort();
+        else controller.signal.addEventListener("abort", onToolAbort, { once: true });
+      });
+      const timeout = new Promise((_, rej) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          controller.abort("tool-timeout");
+          rej(new EngineError("TOOL_TIMEOUT", `L'outil ${name} a dépassé ${Math.round(limit / 1000)} s.`, { status: 504 }));
+        }, limit);
+      });
+      const out = await Promise.race([
+        Promise.resolve().then(() => tool.exec(args || {}, { ...(ctx || {}), signal: controller.signal })),
+        cancellation,
+        timeout
+      ]);
+      const result = out && typeof out === "object" ? out : { success: true, value: out };
+      return { result: { ...result, meta: meta() }, sourceKeys: [] };
+    } catch (e) {
+      if (e instanceof EngineError) return { result: { success: false, code: e.code, error: e.message, meta: meta() }, sourceKeys: [] };
+      log("error", { err: e?.message, tool: name }, "luba-engine : outil en échec");
+      return { result: { success: false, code: "ENGINE_INTERNAL", error: "Erreur interne du moteur.", meta: meta() }, sourceKeys: [] };
+    } finally {
+      clearTimeout(timer);
+      if (ctx?.signal && onParentAbort) ctx.signal.removeEventListener("abort", onParentAbort);
+      if (onToolAbort) controller.signal.removeEventListener("abort", onToolAbort);
+    }
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -1143,7 +1297,7 @@ function createEngine(options = {}) {
       state.timers.push(setInterval(() => { try { sweep(); } catch (e) { log("warn", { err: e.message }, "luba-engine : balayage en échec"); } }, 5 * 60000).unref());
       state.ready = true;
       const c = state.caps;
-      log("info", { version: VERSION, python: c.python.available, compilers: { gxx: c.compilers.gxx.available, gcc: c.compilers.gcc.available }, isolation: c.isolation.method, exec: execPolicy(null).allowed, workdir: base() }, "luba-engine : prêt");
+      log("info", { version: VERSION, python: c.python.available, compilers: { gxx: c.compilers.gxx.available, gcc: c.compilers.gcc.available }, isolation: c.isolation.method, exec: execPolicy("ADMIN").allowed, exec_reason: execPolicy("ADMIN").allowed ? null : execPolicy("ADMIN").reason, isolation_probe: c.isolation.probe, workdir: base() }, "luba-engine : prêt");
       if (!c.python.available) log("warn", {}, "luba-engine : Python/worker indisponible → mode dégradé (ZIP, DOCX, PDF, XLSX, contrôles Python/YAML/XML/HTML/CSS désactivés)");
       return { ready: true, capabilities: capsSummary(true) };
     } catch (e) {
@@ -1185,5 +1339,5 @@ module.exports = {
   schemas: () => defaultEngine.schemas(), has: (n) => defaultEngine.has(n), execute: (n, a, c) => defaultEngine.execute(n, a, c),
   engine: defaultEngine,
   // utilitaires purs (tests)
-  __internals: { cleanRel, safeWritePath, validatePlan, extractJson, scanCppIncludes, parseCompilerDiagnostics, buildCommand, runProcess, scrubbedEnv, hashTree, findExe, classify, prepareWorkdir }
+  __internals: { cleanRel, safeWritePath, validatePlan, extractJson, scanCppIncludes, parseCompilerDiagnostics, buildCommand, runProcess, scrubbedEnv, hashTree, findExe, classify, prepareWorkdir, validateArgs }
 };
