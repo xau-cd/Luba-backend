@@ -5,10 +5,12 @@
   "description": "Backend Node.js de LUBA AI PRO / Milo Backend",
   "main": "index.js",
   "type": "commonjs",
-  "engines": { "node": ">=22.13.0" },
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "scripts": {
     "start": "node index.js",
-    "check": "node --check index.js && node --check worker.js && node --check luba-net.js && node --check luba-engine.js && node --check luba-llm-gestionnaire.js && node --check llm-operation-budget.js",
+    "check": "node --check index.js && node --check worker.js && node --check net.js && node --check luba-net.js && node --check luba-engine.js && node --check luba-llm-gestionnaire.js && node --check llm-operation-budget.js",
     "test": "node --test test/*.test.js",
     "test:modules": "node --test test/modular-architecture.test.js test/llm-operation-budget.test.js test/web-security.test.js",
     "check:python": "python3 -m py_compile luba_worker.py"
