@@ -95,7 +95,7 @@ const { EventEmitter } = require("events");
 const { monitorEventLoopDelay } = require("perf_hooks");
 const { createOperationBudget, remainingMs, tryConsumeGeneration } = require("./llm-operation-budget.js");
 const { createWorker } = require("./worker.js");
-const { createLubaNet } = require("./luba-net.js");
+const { createLubaNet } = require("./net.js");
 const { createLlmManager } = require("./luba-llm-gestionnaire.js");
 
 const express = tryRequire("express");
@@ -2948,20 +2948,54 @@ function mergeSources(...lists) {
 
 // ---------- moteurs de recherche ----------
 const sig = () => AbortSignal.timeout(WEB.SEARCH_TIMEOUT_MS);
-const wrapRes = (arr) => arr.filter((r) => r.url && /^https?:\/\//i.test(r.url)).map((r) => ({ title: cleanName(r.title) || domainOf(r.url), url: r.url, snippet: String(r.snippet || "").replace(/\s+/g, " ").trim().slice(0, 280), domain: domainOf(r.url) }));
+const wrapRes = (arr) => arr.filter((r) => r.url && /^https?:\/\//i.test(r.url)).map((r) => ({ title: cleanName(r.title) || domainOf(r.url), url: r.url, snippet: String(r.snippet || "").replace(/\s+/g, " ").trim().slice(0, 600), domain: domainOf(r.url), publishedDate: r.publishedDate || r.published_date || r.date || r.datePublished || null }));
 
 async function searchSerper(q, n) {
   const res = await fetch("https://google.serper.dev/search", { method: "POST", headers: { "X-API-KEY": process.env.SERPER_API_KEY, "Content-Type": "application/json" }, body: JSON.stringify({ q, num: n, hl: "fr" }), signal: sig() });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const d = await res.json();
-  return wrapRes((d.organic || []).map((o) => ({ title: o.title, url: o.link, snippet: o.snippet })));
+  return wrapRes((d.organic || []).map((o) => ({ title: o.title, url: o.link, snippet: o.snippet, publishedDate: o.date || o.datePublished })));
 }
 async function searchTavily(q, n) {
   const res = await fetch("https://api.tavily.com/search", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ api_key: process.env.TAVILY_API_KEY, query: q, max_results: n }), signal: sig() });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const d = await res.json();
-  return wrapRes((d.results || []).map((o) => ({ title: o.title, url: o.url, snippet: o.content })));
+  return wrapRes((d.results || []).map((o) => ({ title: o.title, url: o.url, snippet: o.content, publishedDate: o.published_date || o.publishedDate })));
 }
+async function searchGoogleCSE(q, n) {
+  const key = process.env.GOOGLE_CSE_API_KEY, cx = process.env.GOOGLE_CSE_ID;
+  if (!key || !cx) throw new Error("Google Custom Search non configuré");
+  const url = new URL("https://www.googleapis.com/customsearch/v1");
+  url.search = new URLSearchParams({ key, cx, q, num: String(Math.min(10, n)), hl: "fr" }).toString();
+  const res = await fetch(url, { signal: sig() }); if (!res.ok) throw new Error(`Google CSE HTTP ${res.status}`);
+  const d = await res.json();
+  return wrapRes((d.items || []).map(o => ({ title: o.title, url: o.link, snippet: o.snippet, publishedDate: o.pagemap?.metatags?.[0]?.['article:published_time'] || o.pagemap?.metatags?.[0]?.date })));
+}
+async function searchPerplexity(q, n) {
+  const key = process.env.PERPLEXITY_API_KEY; if (!key) throw new Error("Perplexity API non configurée");
+  const res = await fetch("https://api.perplexity.ai/chat/completions", { method: "POST", headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" }, body: JSON.stringify({ model: process.env.PERPLEXITY_SEARCH_MODEL || "sonar-pro", messages: [{ role: "system", content: "Effectue une recherche web. N'invente aucune source; reste bref." }, { role: "user", content: q }], temperature: 0.1, max_tokens: 700 }), signal: sig() });
+  if (!res.ok) throw new Error(`Perplexity HTTP ${res.status}`);
+  const d = await res.json(), answer = String(d.choices?.[0]?.message?.content || ""), citations = Array.isArray(d.citations) ? d.citations : [];
+  return wrapRes(citations.slice(0, n).map((url, i) => ({ title: (() => { try { return new URL(url).hostname; } catch { return `Source ${i+1}`; } })(), url, snippet: answer.slice(0, 500) })));
+}
+
+async function searchGoogleCSE(q, n) {
+  const key = process.env.GOOGLE_CSE_API_KEY, cx = process.env.GOOGLE_CSE_ID;
+  if (!key || !cx) throw new Error("Google Custom Search non configuré");
+  const url = new URL("https://www.googleapis.com/customsearch/v1");
+  url.search = new URLSearchParams({ key, cx, q, num: String(Math.min(10, n)), hl: "fr" }).toString();
+  const res = await fetch(url, { signal: sig() }); if (!res.ok) throw new Error(`Google CSE HTTP ${res.status}`);
+  const d = await res.json();
+  return wrapRes((d.items || []).map(o => ({ title: o.title, url: o.link, snippet: o.snippet, publishedDate: o.pagemap?.metatags?.[0]?.['article:published_time'] || o.pagemap?.metatags?.[0]?.date })));
+}
+async function searchPerplexity(q, n) {
+  const key = process.env.PERPLEXITY_API_KEY; if (!key) throw new Error("Perplexity API non configurée");
+  const res = await fetch("https://api.perplexity.ai/chat/completions", { method: "POST", headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" }, body: JSON.stringify({ model: process.env.PERPLEXITY_SEARCH_MODEL || "sonar-pro", messages: [{ role: "system", content: "Effectue une recherche web. N'invente aucune source; reste bref." }, { role: "user", content: q }], temperature: 0.1, max_tokens: 700 }), signal: sig() });
+  if (!res.ok) throw new Error(`Perplexity HTTP ${res.status}`);
+  const d = await res.json(), answer = String(d.choices?.[0]?.message?.content || ""), citations = Array.isArray(d.citations) ? d.citations : [];
+  return wrapRes(citations.slice(0, n).map((url, i) => ({ title: (() => { try { return new URL(url).hostname; } catch { return `Source ${i+1}`; } })(), url, snippet: answer.slice(0, 500) })));
+}
+
 async function searchDDG(q, n) {
   const res = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}&kl=fr-fr`, { headers: { "User-Agent": WEB.UA, "Accept-Language": "fr,en;q=0.8" }, signal: sig() });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -2985,7 +3019,9 @@ async function searchWikipedia(q, n) {
   return wrapRes((d.pages || []).map((p) => ({ title: p.title, url: `https://fr.wikipedia.org/wiki/${encodeURIComponent(String(p.key || p.title).replace(/ /g, "_"))}`, snippet: stripTags(p.excerpt || p.description || "") })));
 }
 const engines = () => [
+  ...(process.env.GOOGLE_CSE_API_KEY && process.env.GOOGLE_CSE_ID ? [["google-cse", searchGoogleCSE]] : []),
   ...(process.env.OPENSERP_URL ? [["openserp", searchOpenSERP]] : []),
+  ...(process.env.PERPLEXITY_API_KEY ? [["perplexity-sonar", searchPerplexity]] : []),
   ...(process.env.SERPER_API_KEY ? [["serper", searchSerper]] : []),
   ...(process.env.TAVILY_API_KEY ? [["tavily", searchTavily]] : []),
   ["duckduckgo", searchDDG], ["wikipedia", searchWikipedia]
@@ -3007,11 +3043,12 @@ async function slowSearch(q, n) {
   for (const { provider, results } of lists) results.forEach((r, i) => {
     const k = normUrl(r.url);
     const e = score.get(k) || { ...r, score: 0, providers: [] };
-    e.score += 1 / (60 + i); e.providers.push(provider);
-    if (!e.snippet && r.snippet) e.snippet = r.snippet;
+    e.score += 1 / (i + 1); if (!e.providers.includes(provider)) e.providers.push(provider);
+    if ((!e.snippet || e.snippet.length < String(r.snippet || "").length) && r.snippet) e.snippet = r.snippet;
+    if (!e.publishedDate && r.publishedDate) e.publishedDate = r.publishedDate;
     score.set(k, e);
   });
-  const merged = [...score.values()].sort((a, b) => b.score - a.score).slice(0, n).map(({ score: _s, providers, ...r }) => ({ ...r, engines: providers }));
+  const merged = [...score.values()].map(e => ({ ...e, score: e.score + Math.min(0.75, (e.providers.length - 1) * 0.25) })).sort((a, b) => b.score - a.score).slice(0, n).map(({ score: _s, providers, ...r }) => ({ ...r, engines: providers }));
   return { provider: lists.map((l) => l.provider).join("+") || null, results: merged, errors };
 }
 
@@ -3077,11 +3114,12 @@ const WEB_TOOLS = {
       const r = await slowSearch(q, 8);
       const results = ws.addResults(r.results);
       results.forEach((x) => run.markFound(x.url, x.title, "slow"));
-      const toRead = results.slice(0, clamp(parseInt(args.pages, 10) || 3, 1, 5));
+      const pagesRequested = clamp(parseInt(args.pages, 10) || 3, 1, 5);
+      const toRead = results.slice(0, Math.min(results.length, Math.max(pagesRequested * 2, 4)));
       const settled = await Promise.allSettled(toRead.map((x) => loadPage(x.url, ws)));
-      const pages = [];
+      const pages = [], readErrors = [];
       settled.forEach((s, i) => {
-        if (s.status !== "fulfilled") return;
+        if (s.status !== "fulfilled") { readErrors.push({ url: toRead[i]?.url || null, error: String(s.reason?.message || s.reason || "read failed").slice(0, 160) }); return; }
         const p = s.value;
         run.markOpened(p.url, p.title, "slow");
         pages.push({ page_id: p.id, ref: toRead[i].id, url: p.url, title: p.title, excerpt: p.text.slice(0, WEB.SLOW_TEXT) });
@@ -3368,7 +3406,7 @@ async function searchOpenSERP(q, n) {
     if (!res.ok) throw new Error(`OpenSERP ${engine} HTTP ${res.status}`);
     const d = await res.json();
     const arr = Array.isArray(d) ? d : (d.results || d.items || d.data || []);
-    return wrapRes(arr.map((o) => ({ title: o.title, url: o.url || o.link, snippet: o.description || o.snippet || o.text })));
+    return wrapRes(arr.map((o) => ({ title: o.title, url: o.url || o.link, snippet: o.description || o.snippet || o.text, publishedDate: o.publishedDate || o.published_date || o.date })));
   };
   try { const r = await call("google"); if (r.length) return r; } catch { /* moteur suivant */ }
   return call("mega");
@@ -5494,7 +5532,7 @@ function buildApp() {
     if (!metrics.enabled) throw Errors.notFound("METRICS_DISABLED", "Métriques désactivées (installe prom-client).");
     if (!hasDebugAccess(req) && !(CONFIG.METRICS_TOKEN && timingSafeStr(req.query.token || "", CONFIG.METRICS_TOKEN))) throw Errors.forbidden("FORBIDDEN", "Accès refusé.");
     res.setHeader("Content-Type", metrics.registry.contentType);
-    res.end(await metrics.registry.metrics);
+    res.end(await metrics.registry.metrics());
   }));
   app.get("/api/debug", wrap(async (req, res) => {
     if (!hasDebugAccess(req)) throw Errors.forbidden("FORBIDDEN", "Accès refusé.");
