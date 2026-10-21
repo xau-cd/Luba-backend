@@ -14,7 +14,7 @@ Le worker ne lit/écrit QUE sous `root` (chemins relatifs, résolus avec realpat
 Il n'exécute JAMAIS de code trouvé dans les fichiers analysés (ast.parse / compile() seulement analysent).
 
 Opérations : capabilities · analyze_file · syntax_check · zip_inspect · zip_extract · project_scan ·
-             read_slice · diff_dirs · pack_zip · hash_tree · syntax_check_many
+             read_slice · diff_dirs · pack_zip · hash_tree · syntax_check_many · extract_blocks
 Compatible Python >= 3.8. Dépendances facultatives (détectées, jamais exigées) : voir requirements.txt.
 """
 import ast
@@ -511,6 +511,8 @@ def op_analyze_file(root, args, limits):
             out["notes"].append("lecture impossible (fichier invalide ou corrompu ?) : " + str(e)[:200])
             out["valid"] = False
         if doc is not None:
+            doc["partial"] = True
+            doc["partial_note"] = "aperçu limité à %d caractères : utiliser extract_blocks pour lire la suite avec références (page / paragraphe / cellules)" % int(limits["preview_chars"])
             out["document"] = doc
             out["valid"] = True
         return out, {"checked": doc is not None, "checks": []}
@@ -519,6 +521,8 @@ def op_analyze_file(root, args, limits):
             data = f.read(min(size, 2 * 1024 * 1024))
         dims = png_dims(data) or jpeg_dims(data)
         out["kind"] = "image"
+        out["understanding"] = "metadata_only"
+        out["notes"].append("image NON comprise : aucun outil de vision n'a été utilisé ; seules les métadonnées techniques sont lues")
         pil = optional("PIL.Image")
         if pil is not None:
             try:
@@ -914,6 +918,117 @@ def op_diff_dirs(root, args, limits):
     return {"added": added[:200], "removed": removed[:200], "changed": changed[:200], "diffs": diffs, "identical": not (added or removed or changed)}, None
 
 
+def op_extract_blocks(root, args, limits):
+    """Lecture PAR BLOCS avec références (pour les gros fichiers) : l'appelant demande la suite avec `start` (curseur).
+    Unités : lignes (texte/code/CSV/JSON…), paragraphes (DOCX), pages (PDF), lignes de feuille (XLSX). `complete` dit si TOUT a été lu."""
+    rel = args.get("path")
+    full = resolve_in_root(root, rel)
+    if not os.path.isfile(full):
+        raise WorkerError("NOT_A_FILE", "n'est pas un fichier : " + str(rel))
+    start = max(0, int(args.get("start") or 0))
+    budget = max(500, min(int(args.get("max_chars") or 12000), 40000))
+    language = detect_language(full)
+    out = {"path": relpath(root, full), "language": language, "blocks": [], "next": None, "complete": True, "total_units": None, "unit": None, "notes": []}
+    used = 0
+
+    def add(ref, text):
+        nonlocal used
+        if used + len(text) > budget and out["blocks"]:
+            return False
+        text = text[:budget]
+        out["blocks"].append({"ref": ref, "text": text}); used += len(text)
+        return True
+
+    if language == "image":
+        out.update({"understanding": "metadata_only", "unit": "image"})
+        out["notes"].append("image NON comprise : aucun outil de vision n'a été utilisé ; seules les métadonnées techniques sont disponibles")
+        return out, {"checked": False, "checks": []}
+    if language == "docx":
+        docx = optional("docx")
+        if docx is None:
+            raise WorkerError("DEPENDENCY_MISSING", "python-docx absent : DOCX non lisible")
+        d = docx.Document(full)
+        paras = [p.text for p in d.paragraphs]
+        out["unit"] = "paragraphe"; out["total_units"] = len(paras)
+        i = start
+        while i < len(paras):
+            if not paras[i].strip():
+                i += 1; continue
+            if not add("paragraphe %d" % (i + 1), paras[i]):
+                break
+            i += 1
+        out["next"] = i if i < len(paras) else None; out["complete"] = out["next"] is None
+        if start == 0 and d.tables:
+            out["notes"].append("%d tableau(x) présent(s) : leur contenu n'est PAS inclus dans ces blocs" % len(d.tables))
+        return out, {"checked": True, "checks": []}
+    if language == "pdf":
+        pypdf = optional("pypdf")
+        if pypdf is None:
+            raise WorkerError("DEPENDENCY_MISSING", "pypdf absent : PDF non lisible")
+        r = pypdf.PdfReader(full)
+        if getattr(r, "is_encrypted", False):
+            out["notes"].append("PDF chiffré : contenu non extrait"); out["complete"] = False
+            return out, {"checked": False, "checks": []}
+        n = len(r.pages); out["unit"] = "page"; out["total_units"] = n
+        i = start; empty = 0
+        while i < n:
+            txt = (r.pages[i].extract_text() or "").strip()
+            if not txt:
+                empty += 1
+            if not add("page %d" % (i + 1), txt or "[aucun texte extractible sur cette page]"):
+                break
+            i += 1
+        out["next"] = i if i < n else None; out["complete"] = out["next"] is None
+        if empty:
+            out["notes"].append("%d page(s) sans texte extractible (scan ? l'OCR n'est pas implémenté)" % empty)
+        return out, {"checked": True, "checks": []}
+    if language == "xlsx":
+        openpyxl = optional("openpyxl")
+        if openpyxl is None:
+            raise WorkerError("DEPENDENCY_MISSING", "openpyxl absent : XLSX non lisible")
+        wb = openpyxl.load_workbook(full, read_only=True, data_only=True)
+        sheets = wb.worksheets
+        out["unit"] = "ligne de feuille"
+        # curseur = index global de ligne parcourue (feuilles mises bout à bout)
+        pos = 0; stop = False; total = 0
+        for ws in sheets:
+            ncols = min(ws.max_column or 1, 30)
+            for ri, row in enumerate(ws.iter_rows(values_only=True), start=1):
+                total += 1
+                if pos < start:
+                    pos += 1; continue
+                if stop:
+                    continue
+                cells = ["" if v is None else str(v) for v in row[:ncols]]
+                if not any(cells):
+                    pos += 1; continue
+                ref = "%s!A%d:%s%d" % (ws.title, ri, openpyxl.utils.get_column_letter(max(1, len(cells))), ri)
+                if not add(ref, " | ".join(cells)):
+                    stop = True; continue
+                pos += 1
+        wb.close()
+        out["total_units"] = total
+        out["next"] = pos if (stop or pos < total) else None; out["complete"] = out["next"] is None
+        out["notes"].append("valeurs calculées lues en mode lecture seule ; formules, graphiques et mises en forme ignorés")
+        return out, {"checked": True, "checks": []}
+    # texte / code / csv / json / md / log …
+    _, data, text, enc, binary = read_text(root, rel, limits)
+    if binary:
+        raise WorkerError("BINARY_FILE", "fichier binaire : lecture par blocs impossible")
+    lines = text.splitlines()
+    out["unit"] = "ligne"; out["total_units"] = len(lines); out["encoding"] = enc
+    i = start; chunk = []; chunk_start = i
+    while i < len(lines):
+        line = lines[i]
+        if used + sum(len(x) + 1 for x in chunk) + len(line) > budget and (chunk or out["blocks"]):
+            break
+        chunk.append(line[:2000]); i += 1
+    if chunk:
+        add("lignes %d-%d" % (chunk_start + 1, chunk_start + len(chunk)), "\n".join(chunk))
+    out["next"] = i if i < len(lines) else None; out["complete"] = out["next"] is None
+    return out, {"checked": True, "checks": []}
+
+
 def op_capabilities(root, args, limits):
     mods = {}
     for label, mod in (("openpyxl", "openpyxl"), ("pandas", "pandas"), ("python-docx", "docx"), ("pypdf", "pypdf"), ("Pillow", "PIL"),
@@ -946,7 +1061,7 @@ def op_capabilities(root, args, limits):
 OPS = {
     "capabilities": op_capabilities, "analyze_file": op_analyze_file, "syntax_check": op_syntax_check, "zip_inspect": op_zip_inspect,
     "zip_extract": op_zip_extract, "project_scan": op_project_scan, "read_slice": op_read_slice, "diff_dirs": op_diff_dirs,
-    "pack_zip": op_pack_zip, "hash_tree": op_hash_tree, "syntax_check_many": op_syntax_check_many,
+    "pack_zip": op_pack_zip, "hash_tree": op_hash_tree, "syntax_check_many": op_syntax_check_many, "extract_blocks": op_extract_blocks,
 }
 
 

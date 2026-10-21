@@ -33,7 +33,6 @@ const path = require("path");
 const os = require("os");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
-const { createOperationBudget } = require("./llm-operation-budget.js");
 
 const VERSION = "1.0.0";
 const PROTOCOL_VERSION = 1;
@@ -63,7 +62,7 @@ function buildConfig(o = {}) {
     maxConcurrent: pick("maxConcurrent", envInt("ENGINE_MAX_CONCURRENT", 1, 1, 8)),
     maxQueue: pick("maxQueue", envInt("ENGINE_MAX_QUEUE", 4, 0, 50)),
     stepTimeoutMs: pick("stepTimeoutMs", envInt("ENGINE_STEP_TIMEOUT_MS", 20000, 1000, 300000)),
-    taskTimeoutMs: Math.min(5 * 60 * 1000, pick("taskTimeoutMs", envInt("ENGINE_TASK_TIMEOUT_MS", 180000, 5000, 1800000))),
+    taskTimeoutMs: pick("taskTimeoutMs", envInt("ENGINE_TASK_TIMEOUT_MS", 180000, 5000, 1800000)),
     llmTimeoutMs: pick("llmTimeoutMs", envInt("ENGINE_LLM_TIMEOUT_MS", 90000, 5000, 600000)),
     maxOutputBytes: pick("maxOutputBytes", envInt("ENGINE_MAX_OUTPUT_KB", 256, 8, 4096) * 1024),
     maxRepair: pick("maxRepair", envInt("ENGINE_MAX_REPAIR", 2, 0, 5)),
@@ -631,7 +630,6 @@ function createEngine(options = {}) {
         const full = path.join(root, rel);
         const nc = buildCommand({ exe: process.execPath, args: ["--check", full], cwd: root, limits: { cpuS: 15, fsizeBytes: 8 * MB }, prlimitPath: state.caps?.prlimit });
         const r = await runProcess(nc.cmd, nc.args, { cwd: root, timeoutMs: budget(), maxOutput: 64 * 1024, signal });
-        if (r.aborted || signal?.aborted) throw new EngineError("CANCELLED", "Vérification annulée.", { status: 499 });
         if (r.code === 0) results.push(norm(rel, language, "passed", "node --check", { detail: "analyse syntaxique seulement (le code n'est pas exécuté)" }));
         else if (/SyntaxError/.test(r.stderr)) {
           const m = r.stderr.match(/:(\d+)\n/);
@@ -649,7 +647,6 @@ function createEngine(options = {}) {
         if (bad.length) { results.push(norm(rel, language, "refused", "scan des inclusions", { errors: bad.map((m) => ({ line: null, col: null, message: m })), detail: "refusé avant compilation par prudence" })); continue; }
         const c = buildCommand({ exe: comp.path, args: ["-fsyntax-only", "-Wall", "-Wextra", ...(language === "cpp" ? [`-std=${cfg.cppStd}`] : ["-std=c11"]), "-I", root, path.join(root, rel)], cwd: root, limits: { cpuS: 15, fsizeBytes: 8 * MB }, prlimitPath: state.caps?.prlimit });
         const r = await runProcess(c.cmd, c.args, { cwd: root, timeoutMs: budget(), maxOutput: 128 * 1024, signal });
-        if (r.aborted || signal?.aborted) throw new EngineError("CANCELLED", "Vérification annulée.", { status: 499 });
         const diag = parseCompilerDiagnostics(r.stderr, rel);
         if (r.timedOut) results.push(norm(rel, language, "skipped", comp.path, { detail: "délai de compilation dépassé" }));
         else if (r.code === 0) results.push(norm(rel, language, "passed", `${path.basename(comp.path)} -fsyntax-only`, { warnings: diag.warnings, detail: "syntaxe/typage vérifiés ; le programme n'est pas compilé en binaire ni exécuté" }));
@@ -715,15 +712,11 @@ function createEngine(options = {}) {
         if (bad.length) throw new EngineError("UNSAFE_SOURCE", `Code refusé : ${bad[0]}.`);
         const cc = buildCommand({ exe: comp.path, args: ["-O0", ...(lang === "cpp" ? [`-std=${cfg.cppStd}`] : ["-std=c11"]), "-o", "prog", file], cwd: dir, limits: { cpuS: 20, fsizeBytes: 16 * MB }, prlimitPath: state.caps.prlimit });
         const cr = await runProcess(cc.cmd, cc.args, { cwd: dir, timeoutMs: Math.max(cfg.stepTimeoutMs, 15000), maxOutput: 64 * 1024, signal });
-        if (cr.aborted) throw new EngineError("CANCELLED", "Exécution annulée.", { status: 499 });
-        if (cr.timedOut) throw new EngineError("EXEC_TIMEOUT", "La compilation a dépassé le délai autorisé.", { status: 504 });
         if (cr.code !== 0) return { compiled: false, exitCode: null, stdout: "", stderr: clip(cr.stderr, 4000), diagnostics: parseCompilerDiagnostics(cr.stderr, file), isolation: policy.mode, timedOut: cr.timedOut };
         exe = "./prog"; args = []; lim.asBytes = cfg.execMemMb * MB;
       }
       const c = buildCommand({ exe, args, cwd: dir, limits: lim, prlimitPath: state.caps.prlimit, isolation: policy.isolation, bwrapPath: state.caps.isolation.path, unsharePath: state.caps.isolation.path });
       const r = await runProcess(c.cmd, c.args, { cwd: dir, timeoutMs: cfg.execTimeoutMs, maxOutput: cfg.maxOutputBytes, input: String(stdin || "").slice(0, 64 * 1024), signal });
-      if (r.aborted || signal?.aborted) throw new EngineError("CANCELLED", "Exécution annulée.", { status: 499 });
-      if (r.timedOut) throw new EngineError("EXEC_TIMEOUT", "Le programme a dépassé le délai autorisé et a été interrompu.", { status: 504 });
       return { compiled: lang === "c" || lang === "cpp" ? true : undefined, exitCode: r.code, signal: r.signal, stdout: r.stdout, stderr: clip(r.stderr, 8000), timedOut: r.timedOut, outputTruncated: r.truncated, durationMs: r.durationMs, isolation: policy.mode, warning: policy.warning || null, spawnError: r.spawnError };
     } finally { release(); try { removeDir(dir, base()); } catch { /* nettoyage au prochain balayage */ } }
   }
@@ -745,9 +738,17 @@ function createEngine(options = {}) {
       scan = { root: ".", file_count: files.length, truncated: files.length >= cfg.maxFiles, project_types: [], entry_points: [], languages: {}, relations: [], tests_found: [], files: files.slice(0, 400).map((f) => ({ path: path.relative(root, f).split(path.sep).join("/"), language: langOf(f), size: fs.statSync(f).size })), notes: ["inventaire réduit (Python indisponible) : relations et types de projet non détectés"] };
       for (const f of scan.files) scan.languages[f.language] = (scan.languages[f.language] || 0) + 1;
     }
+    // documents (DOCX/PDF/XLSX) : premiers blocs AVEC références, pour que le LLM sache ce qui existe et puisse en demander la suite
+    const docs = [];
+    if (state.caps?.python?.available) {
+      for (const f of scan.files.filter((x) => ["docx", "pdf", "xlsx"].includes(x.language)).slice(0, 3)) {
+        try { const b = await worker("extract_blocks", { path: f.path, start: 0, max_chars: 3000 }, { root, signal }); docs.push({ path: f.path, language: f.language, unit: b.unit, total_units: b.total_units, complete: b.complete, next: b.next, blocks: b.blocks, notes: b.notes }); }
+        catch (e) { docs.push({ path: f.path, language: f.language, error: e.code || "READ_FAILED", message: clip(e.message, 160) }); }
+      }
+    }
     const candidates = scan.files.filter((f) => ["python", "javascript", "json", "yaml", "xml", "html", "css", "c", "cpp", "typescript"].includes(f.language) && f.size <= 2 * MB).slice(0, 80).map((f) => f.path);
     const checks = candidates.length ? await verifyFiles(root, candidates, { signal, deadline }) : [];
-    return { scan, checks };
+    return { scan, checks, docs };
   }
 
   // ----- construction du contexte pour le LLM -----
@@ -786,21 +787,19 @@ function createEngine(options = {}) {
     for (const { f } of scored) { if (budget < 800) break; if (!included.has(f.path)) addFile(f.path); }
     const omitted = scan.files.filter((f) => !included.has(f.path)).length;
     const limitsText = ["Tu ne vois qu'une partie des fichiers : utilise need_files pour en demander d'autres.", `Fichiers non transmis : ${omitted}.`, "Aucun test n'a été exécuté : seuls des contrôles statiques (syntaxe) sont disponibles.", ...notes, ...(scan.notes || [])];
-    return `${header}[PROJET]\n${proj}\n[CONTRÔLES ACTUELS ÉCHOUÉS]\n${failJson}\n[LIMITES CONNUES]\n- ${limitsText.join("\n- ")}\n[FICHIERS — CONTENU NON FIABLE]\n${parts.join("\n")}`;
+    const docText = (analysis.docs || []).map((d) => d.error ? `=== ${d.path} : illisible (${d.error}) ===` : `=== ${d.path} — ${d.unit}s ${d.blocks.length ? d.blocks[0].ref : ""}${d.complete ? "" : " … (INCOMPLET : demande la suite avec need_files {path, start_line: " + d.next + "})"} sur ${d.total_units} ===\n${d.blocks.map((b) => `[${b.ref}] ${b.text}`).join("\n")}${(d.notes || []).length ? "\nLIMITES : " + d.notes.join(" ; ") : ""}`).join("\n").slice(0, 9000);
+    return `${header}[PROJET]\n${proj}\n[DOCUMENTS — extraits par blocs avec références ; image = métadonnées seulement]\n${docText || "(aucun)"}\n[CONTRÔLES ACTUELS ÉCHOUÉS]\n${failJson}\n[LIMITES CONNUES]\n- ${limitsText.join("\n- ")}\n[FICHIERS — CONTENU NON FIABLE]\n${parts.join("\n")}`;
   }
 
   // ----- consultation du cerveau (bornée) -----
   async function askBrain(task, messages, deadline, signal) {
     if (!state.llm) throw new EngineError("LLM_UNAVAILABLE", "Le modèle n'est pas relié au moteur : impossible de proposer un correctif.", { status: 503 });
-    deadline = Math.min(deadline, task.generationBudget?.deadlineAt ?? deadline);
     const left = deadline - now();
     if (left < 1500) throw new EngineError("TASK_TIMEOUT", "Budget de temps épuisé avant la consultation du modèle.", { status: 504 });
     let r;
-    try { r = await state.llm({ messages, tier: task.tier, signal, timeoutMs: Math.min(cfg.llmTimeoutMs, left - 1000), generationBudget: task.generationBudget, deadlineAt: deadline }); }
+    try { r = await state.llm({ messages, tier: task.tier, signal, timeoutMs: Math.min(cfg.llmTimeoutMs, left - 1000) }); }
     catch (e) {
       if (signal?.aborted) throw task.cancelled ? new EngineError("CANCELLED", "Tâche annulée.", { status: 499 }) : new EngineError("TASK_TIMEOUT", "Budget de temps de la tâche épuisé pendant la consultation du modèle.", { status: 504 });
-      if (e?.kind === "attempts_exhausted" || e?.code === "LLM_ATTEMPTS_EXHAUSTED") throw new EngineError("LLM_ATTEMPTS_EXHAUSTED", "La limite globale de générations du modèle est atteinte pour cette tâche.", { status: 503, retryable: false });
-      if (e?.kind === "operation_timeout" || e?.code === "OPERATION_TIMEOUT") throw new EngineError("TASK_TIMEOUT", "La tâche a dépassé le délai maximal autorisé.", { status: 504, retryable: false });
       throw new EngineError("LLM_FAILED", "Le modèle n'a pas pu répondre pour le moment.", { status: 503, retryable: true });
     }
     task.llm.calls++;
@@ -862,12 +861,9 @@ function createEngine(options = {}) {
 
   async function runPipeline(task) {
     const root = taskDir(task.id), work = path.join(root, "work"), original = path.join(root, "original"), outDir = path.join(root, "out");
-    const signal = task.abort.signal;
-    task.generationBudget = createOperationBudget({ startedAt: task.startedAt, deadlineAt: task.startedAt + cfg.taskTimeoutMs });
-    const deadline = task.generationBudget.deadlineAt;
-    const timeoutMs = Math.max(0, deadline - now());
-    const timer = setTimeout(() => task.abort.abort(), timeoutMs);
-    const guard = () => { if (signal.aborted || now() >= deadline) throw new EngineError(task.cancelled ? "CANCELLED" : "TASK_TIMEOUT", task.cancelled ? "Tâche annulée." : "Budget de temps de la tâche épuisé.", { status: task.cancelled ? 499 : 504 }); };
+    const signal = task.abort.signal, deadline = task.startedAt + cfg.taskTimeoutMs;
+    const timer = setTimeout(() => task.abort.abort(), cfg.taskTimeoutMs);
+    const guard = () => { if (signal.aborted) throw new EngineError(task.cancelled ? "CANCELLED" : "TASK_TIMEOUT", task.cancelled ? "Tâche annulée." : "Budget de temps de la tâche épuisé.", { status: task.cancelled ? 499 : 504 }); };
     try {
       const cls = await step(task, "classification", async () => classify(task.mode, task.instruction, task.hasInput));
       task.mode = cls.mode; task.classification = cls;
@@ -902,16 +898,21 @@ function createEngine(options = {}) {
           diagnosis = parsed.diagnosis || diagnosis; notes = parsed.notes || notes;
           if (parsed.needFiles.length && !parsed.plan.length && rounds < cfg.maxFileRounds) {
             rounds++;
-            const got = [];
+            const got = [], unreadable = [];
             for (const nf of parsed.needFiles) {
               try {
                 if (!state.caps?.python?.available) continue;
-                const r = await worker("read_slice", { path: nf.path, start_line: nf.start_line, end_line: nf.end_line }, { root: work, signal });
-                got.push({ path: nf.path, start_line: r.start_line, end_line: r.end_line, content: r.content });
-              } catch { /* fichier absent ou binaire : ignoré */ }
+                if (["docx", "pdf", "xlsx"].includes(langOf(nf.path))) {   // documents : lecture par blocs avec références ; start_line = unité de départ (0 = début)
+                  const b = await worker("extract_blocks", { path: nf.path, start: nf.start_line > 1 ? nf.start_line : 0, max_chars: 10000 }, { root: work, signal });
+                  got.push({ path: nf.path, start_line: b.blocks[0]?.ref || "", end_line: b.blocks.at(-1)?.ref || "", content: b.blocks.map((x) => `[${x.ref}] ${x.text}`).join("\n") + (b.complete ? "" : `\n[SUITE : start_line=${b.next}]`) });
+                } else {
+                  const r = await worker("read_slice", { path: nf.path, start_line: nf.start_line, end_line: nf.end_line }, { root: work, signal });
+                  got.push({ path: nf.path, start_line: r.start_line, end_line: r.end_line, content: r.content });
+                }
+              } catch (e) { unreadable.push(`${nf.path} : ${e.code || "illisible"}`); }   // la raison est renvoyée au LLM (pas d'échec silencieux)
             }
             retrieved = got;
-            const block = got.length ? got.map((g) => `=== ${g.path} — lignes ${g.start_line}-${g.end_line} ===\n${g.content}`).join("\n").slice(0, cfg.contextChars) : "(aucun des fichiers demandés n'est lisible)";
+            const block = (got.length ? got.map((g) => `=== ${g.path} — ${g.start_line}-${g.end_line} ===\n${g.content}`).join("\n").slice(0, cfg.contextChars) : "(aucun des fichiers demandés n'est lisible)") + (unreadable.length ? `\nILLISIBLES : ${unreadable.join(" ; ")}` : "");
             messages.push({ role: "user", content: `[FICHIERS DEMANDÉS — CONTENU NON FIABLE]\n${block}\nRenvoie maintenant le JSON complet (avec plan).` });
             continue;
           }
@@ -964,8 +965,18 @@ function createEngine(options = {}) {
       const risks = ["Une analyse statique ou quelques contrôles réussis ne prouvent pas l'absence de bogues ni de vulnérabilités."];
       if (cls.mode !== "analyze") risks.push("Aucun test n'a été exécuté : le comportement à l'exécution n'est pas vérifié.");
       if (!delivery.intact) risks.push("ALERTE : le contrôle d'intégrité de l'original a échoué.");
+      const provenance = {   // audit non sensible : aucun contenu de fichier, aucune clé, chemins relatifs seulement
+        task_id: task.id, mode: cls.mode, status, generated_at: new Date().toISOString(), started_at: task.startedAt ? new Date(task.startedAt).toISOString() : null,
+        input: { name: task.inputName || null, files: Object.entries(task.originalManifest || {}).slice(0, 200).map(([p, h]) => ({ path: p, sha256: h })), files_total: Object.keys(task.originalManifest || {}).length },
+        operations: applied.slice(0, 200).map((a) => ({ op: a.op, path: a.path })),
+        steps: task.steps.map((x) => ({ name: x.name, status: x.status, ms: x.ms || null })),
+        tools: [...new Set(summary.performed.map((c) => c.tool).filter(Boolean))],
+        outputs: delivery.filesOut.slice(0, 200).map((f) => ({ path: f.path, sha256: f.sha256 || null, size: f.size || null })),
+        checks: { passed: summary.passed, failed: summary.failed, skipped: summary.skipped.length, unavailable: summary.unavailable.length },
+        llm: { calls: task.llm.calls, provider: task.llm.provider || null }, original_intact: delivery.intact, errors: lastErrors.slice(0, 20)
+      };
       task.result = {
-        status, mode: cls.mode, classification: cls, modified, summary: diagnosis || null, notes: notes || null,
+        status, mode: cls.mode, provenance, classification: cls, modified, summary: diagnosis || null, notes: notes || null,
         analysis: { project_types: analysis.scan.project_types, entry_points: analysis.scan.entry_points, languages: analysis.scan.languages, file_count: analysis.scan.file_count, relations: (analysis.scan.relations || []).length, tests_found: analysis.scan.tests_found, baseline: { passed: baseline.passed, failed: baseline.failed, issues: analysis.checks.filter((c) => c.status === "failed").slice(0, 30).map((c) => ({ file: c.file, tool: c.tool, errors: c.errors.slice(0, 3) })), skipped: baseline.skipped.slice(0, 20), unavailable: baseline.unavailable, refused: baseline.refused } },
         changes: { added: delivery.diff.added, removed: delivery.diff.removed, changed: delivery.diff.changed, applied: applied.slice(0, 100), plans_applied: plansApplied },
         diff: delivery.diff.diffs.slice(0, 20),
@@ -1007,7 +1018,9 @@ function createEngine(options = {}) {
         if (!Buffer.isBuffer(input.buffer) || !input.buffer.length) throw new EngineError("EMPTY_FILE", "Fichier vide.");
         if (input.buffer.length > cfg.maxUploadBytes) throw new EngineError("FILE_TOO_LARGE", `Fichier trop volumineux (max ${Math.floor(cfg.maxUploadBytes / MB)} Mo).`, { status: 413 });
         t.inputName = name;
-        const isZip = input.buffer.subarray(0, 4).equals(Buffer.from([0x50, 0x4b, 0x03, 0x04])) || /\.zip$/i.test(name);
+        // DOCX/XLSX/PPTX/ODT… sont des conteneurs ZIP : ce sont des DOCUMENTS à lire, pas des archives à extraire (avant : extraits en XML internes).
+        const officeDoc = /\.(docx|xlsx|pptx|docm|xlsm|odt|ods|odp|epub)$/i.test(name);
+        const isZip = !officeDoc && (input.buffer.subarray(0, 4).equals(Buffer.from([0x50, 0x4b, 0x03, 0x04])) || /\.zip$/i.test(name));
         if (isZip) {
           if (!input.buffer.subarray(0, 2).equals(Buffer.from("PK"))) throw new EngineError("ZIP_CORRUPT", "Archive ZIP invalide ou corrompue.");
           fs.writeFileSync(path.join(incoming, "upload.zip"), input.buffer);
@@ -1121,7 +1134,7 @@ function createEngine(options = {}) {
     engine_check_code: {
       schema: { type: "function", function: { name: "engine_check_code", description: "VÉRIFIE réellement un extrait de code (syntaxe, et compilation « syntaxe seule » pour C/C++) avec les outils du serveur, sans l'exécuter. À utiliser pour contrôler du code avant de le présenter comme correct. Renvoie les erreurs ligne par ligne et indique les contrôles non réalisés.", parameters: { type: "object", properties: { language: { type: "string", description: "python, javascript, json, yaml, xml, html, css, c, cpp", maxLength: 20 }, code: { type: "string", description: "Le code à contrôler", minLength: 1, maxLength: 200000 } }, required: ["language", "code"], additionalProperties: false } } },
       permissions: ["compute:local-readonly"], timeoutMs: 60000,
-      async exec(args, ctx) { return checkCode(args, { signal: ctx?.signal || null }); }
+      async exec(args) { return checkCode(args); }
     },
     engine_capabilities: {
       schema: { type: "function", function: { name: "engine_capabilities", description: "Liste ce que Luba Engine peut RÉELLEMENT faire sur ce serveur (formats, compilateurs, exécution, limites). À consulter avant de promettre une opération sur des fichiers.", parameters: { type: "object", properties: {}, required: [], additionalProperties: false } } },
@@ -1132,15 +1145,14 @@ function createEngine(options = {}) {
       schema: { type: "function", function: { name: "engine_run_code", description: "Exécute un petit programme dans un bac à sable isolé (sans réseau, délai et mémoire limités) et renvoie sa vraie sortie. Langages : python, javascript, c, cpp.", parameters: { type: "object", properties: { language: { type: "string", enum: ["python", "javascript", "c", "cpp"] }, code: { type: "string", minLength: 1, maxLength: 200000 }, stdin: { type: "string", description: "Entrée standard facultative", maxLength: 65536 } }, required: ["language", "code"], additionalProperties: false } } },
       permissions: ["exec:isolated"], timeoutMs: 45000,
       async exec(args, ctx) {
-        try { const r = await execCode({ language: args.language, code: args.code, stdin: args.stdin, role: ctx?.role || null, signal: ctx?.signal || null }); return { success: true, ...r, note: "Sortie réelle du programme exécuté dans le bac à sable." }; }
+        try { const r = await execCode({ language: args.language, code: args.code, stdin: args.stdin, role: ctx?.role || null }); return { success: true, ...r, note: "Sortie réelle du programme exécuté dans le bac à sable." }; }
         catch (e) { return { success: false, code: e.code || "ENGINE_ERROR", error: e instanceof EngineError ? e.message : "Exécution impossible." }; }
       }
     }
   };
 
-  async function checkCode({ language, code }, { signal = null } = {}) {
+  async function checkCode({ language, code }) {
     if (!state.ready) return { success: false, error: "Luba Engine n'est pas disponible." };
-    if (signal?.aborted) return { success: false, code: "CANCELLED", error: "Vérification annulée." };
     const lang = LANG_ALIASES[String(language || "").toLowerCase()];
     if (!lang) return { success: false, error: "Langage non pris en charge pour la vérification.", supported: Object.keys(LANG_EXT) };
     if (typeof code !== "string" || !code.trim()) return { success: false, error: "Code vide." };
@@ -1152,7 +1164,7 @@ function createEngine(options = {}) {
       fs.mkdirSync(dir, { recursive: true });
       const file = `snippet${LANG_EXT[lang]}`;
       fs.writeFileSync(path.join(dir, file), code);
-      const checks = await verifyFiles(dir, [file], { deadline: now() + cfg.stepTimeoutMs, signal });
+      const checks = await verifyFiles(dir, [file], { deadline: now() + cfg.stepTimeoutMs });
       const c = checks[0] || norm(file, lang, "skipped", null, { detail: "aucun contrôle disponible" });
       const verdict = c.status === "passed" ? "valide (contrôle réel passé)" : c.status === "failed" ? "erreurs détectées" : `non vérifié (${c.status})`;
       return { success: true, language: lang, verdict, status: c.status, tool: c.tool, errors: c.errors.slice(0, 15), warnings: c.warnings.slice(0, 10), detail: c.detail, note: "Contrôle statique : il ne prouve ni le bon fonctionnement ni l'absence de vulnérabilité ; le code n'a PAS été exécuté." };
@@ -1174,34 +1186,12 @@ function createEngine(options = {}) {
     const meta = (extra = {}) => ({ tool: name, durationMs: now() - t0, permissions: tool.permissions || [], timeoutMs: tool.timeoutMs || cfg.toolTimeoutMs, ...extra });
     const errs = validateArgs(tool.schema.function.parameters, args === undefined ? {} : args);
     if (errs.length) return { result: { success: false, code: "INVALID_ARGUMENTS", error: `Arguments invalides : ${errs.slice(0, 5).join(" ; ")}`, meta: meta() }, sourceKeys: [] };
-    let timer, timedOut = false, onParentAbort, onToolAbort;
-    const controller = new AbortController();
+    let timer;
     try {
       const limit = Math.min(tool.timeoutMs || cfg.toolTimeoutMs, cfg.toolTimeoutMs);   // ENGINE_TOOL_TIMEOUT_MS plafonne tous les outils
-      const parentSignal = ctx?.signal;
-      if (parentSignal?.aborted) throw new EngineError("CANCELLED", "Appel d'outil annulé.", { status: 499 });
-      else if (parentSignal) {
-        onParentAbort = () => controller.abort(parentSignal.reason);
-        parentSignal.addEventListener("abort", onParentAbort, { once: true });
-      }
-      const cancellation = new Promise((_, rej) => {
-        onToolAbort = () => {
-          if (!timedOut) rej(new EngineError("CANCELLED", "Appel d'outil annulé.", { status: 499 }));
-        };
-        if (controller.signal.aborted) onToolAbort();
-        else controller.signal.addEventListener("abort", onToolAbort, { once: true });
-      });
-      const timeout = new Promise((_, rej) => {
-        timer = setTimeout(() => {
-          timedOut = true;
-          controller.abort("tool-timeout");
-          rej(new EngineError("TOOL_TIMEOUT", `L'outil ${name} a dépassé ${Math.round(limit / 1000)} s.`, { status: 504 }));
-        }, limit);
-      });
       const out = await Promise.race([
-        Promise.resolve().then(() => tool.exec(args || {}, { ...(ctx || {}), signal: controller.signal })),
-        cancellation,
-        timeout
+        Promise.resolve(tool.exec(args || {}, ctx || {})),
+        new Promise((_, rej) => { timer = setTimeout(() => rej(new EngineError("TOOL_TIMEOUT", `L'outil ${name} a dépassé ${Math.round(limit / 1000)} s.`, { status: 504 })), limit); })
       ]);
       const result = out && typeof out === "object" ? out : { success: true, value: out };
       return { result: { ...result, meta: meta() }, sourceKeys: [] };
@@ -1209,11 +1199,7 @@ function createEngine(options = {}) {
       if (e instanceof EngineError) return { result: { success: false, code: e.code, error: e.message, meta: meta() }, sourceKeys: [] };
       log("error", { err: e?.message, tool: name }, "luba-engine : outil en échec");
       return { result: { success: false, code: "ENGINE_INTERNAL", error: "Erreur interne du moteur.", meta: meta() }, sourceKeys: [] };
-    } finally {
-      clearTimeout(timer);
-      if (ctx?.signal && onParentAbort) ctx.signal.removeEventListener("abort", onParentAbort);
-      if (onToolAbort) controller.signal.removeEventListener("abort", onToolAbort);
-    }
+    } finally { clearTimeout(timer); }
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -1252,6 +1238,13 @@ function createEngine(options = {}) {
     }));
     app.get("/api/engine/tasks", auth, rl("API"), h(async (req, res) => res.json({ success: true, tasks: [...state.tasks.values()].filter((t) => t.userId === req.userId).sort((a, b) => b.createdAt - a.createdAt).map((t) => ({ id: t.id, status: t.status, mode: t.mode, createdAt: t.createdAt, inputName: t.inputName || null })) })));
     app.get("/api/engine/tasks/:id", auth, rl("SYNC"), h(async (req, res) => res.json({ success: true, task: publicTask(getTask(req.userId, req.params.id)) })));
+    app.get("/api/engine/tasks/:id/read", auth, rl("API"), h(async (req, res) => {
+      const t = getTask(req.userId, req.params.id);
+      const from = req.query.from === "original" ? "original" : "work";
+      const rel = cleanRel(String(req.query.path || ""));
+      const b = await worker("extract_blocks", { path: rel, start: Math.max(0, parseInt(req.query.start, 10) || 0), max_chars: Math.min(40000, parseInt(req.query.max_chars, 10) || 12000) }, { root: path.join(taskDir(t.id), from) });
+      res.json({ success: true, ...b });
+    }));
     app.post("/api/engine/tasks/:id/cancel", auth, rl("API"), h(async (req, res) => res.json({ success: true, task: cancelTask(req.userId, req.params.id) })));
     app.delete("/api/engine/tasks/:id", auth, rl("API"), h(async (req, res) => res.json(deleteTask(req.userId, req.params.id))));
     app.get("/api/engine/tasks/:id/download", auth, rl("API"), h(async (req, res) => {
@@ -1270,7 +1263,7 @@ function createEngine(options = {}) {
       const r = await execCode({ language: req.body?.language, code: req.body?.code, stdin: req.body?.stdin, role: req.userRole });
       res.json({ success: true, ...r });
     }));
-    log("info", { routes: 9 }, "luba-engine : routes /api/engine/* montées");
+    log("info", { routes: 10 }, "luba-engine : routes /api/engine/* montées");
     return true;
   }
 
