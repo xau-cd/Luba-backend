@@ -5550,7 +5550,7 @@ function buildApp() {
     if (!metrics.enabled) throw Errors.notFound("METRICS_DISABLED", "Métriques désactivées (installe prom-client).");
     if (!hasDebugAccess(req) && !(CONFIG.METRICS_TOKEN && timingSafeStr(req.query.token || "", CONFIG.METRICS_TOKEN))) throw Errors.forbidden("FORBIDDEN", "Accès refusé.");
     res.setHeader("Content-Type", metrics.registry.contentType);
-    res.end(await metrics.registry.metrics);
+    res.end(await metrics.registry.metrics());
   }));
   app.get("/api/debug", wrap(async (req, res) => {
     if (!hasDebugAccess(req)) throw Errors.forbidden("FORBIDDEN", "Accès refusé.");
@@ -15696,6 +15696,17 @@ function setupLubaLiveWebSocket(server) {
     };
     liveSessions.set(sid, state);
 
+    // [LIVE] Ping de maintien : les proxys coupent les sockets inactives (~55 s) et une socket à moitié morte paraît « ouverte » côté client.
+    ws.isAlive = true;
+    ws.on("pong", () => { ws.isAlive = true; });
+    const hb = setInterval(() => {
+      if (ws.isAlive === false) { try { ws.terminate(); } catch {} return; }
+      ws.isAlive = false;
+      try { ws.ping(); } catch {}
+    }, 25000);
+    hb.unref?.();
+    state.heartbeat = hb;
+
     if (metrics?.activeWebSockets) metrics.activeWebSockets.labels("live").inc();
     logger.info({ sessionId: sid }, "🔌 Luba Live connecté");
 
@@ -15710,7 +15721,11 @@ function setupLubaLiveWebSocket(server) {
     });
 
     ws.on("close", () => {
-      cancelLiveRun(state, "ws_close");   // [audit] client parti : on n'alimente plus une génération que personne n'écoute
+      clearInterval(state.heartbeat);
+      // [LIVE] Délai de grâce : une coupure réseau brève ne doit pas détruire la réponse en cours (le client la relit ensuite dans la conversation).
+      const graceMs = Math.max(0, parseInt(process.env.LIVE_CLOSE_GRACE_MS || "25000", 10));
+      if (graceMs === 0) cancelLiveRun(state, "ws_close");
+      else { const gt = setTimeout(() => cancelLiveRun(state, "ws_close"), graceMs); gt.unref?.(); }   // [audit] client réellement parti : on n'alimente plus une génération que personne n'écoute
       liveSessions.delete(sid);
       if (metrics?.activeWebSockets) metrics.activeWebSockets.labels("live").dec();
     });
