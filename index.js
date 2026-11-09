@@ -2636,7 +2636,10 @@ function loadLegacy() {
 const v17Api = {
   chat: (args) => legacyChatBridge(args),
   cancelRun: (run) => runManager.cancel(run.id, run.userId),   // [audit] annulation propagée jusqu'au fournisseur LLM (AbortController du run)
-  authenticate: (req, res, next) => authenticate()(req, res, next)
+  authenticate: (req, res, next) => authenticate()(req, res, next),
+  get uploadService() { return getUploadService(); },
+  processUploads: (files) => processUploads(files),
+  docBlock: (docs, rejected) => docBlock(docs, rejected)
 };
 
 function pipeRunToSse(run, sse) {
@@ -5236,6 +5239,17 @@ const upload = multer ? multer({
   limits: { fileSize: CONFIG.LIMITS.MAX_FILE_SIZE_MB * 1024 * 1024, files: CONFIG.LIMITS.MAX_IMAGES_PER_REQUEST + CONFIG.LIMITS.MAX_FILES_PER_REQUEST }
   // pas de filtre MIME : chaque fichier est classé par son CONTENU dans processUploads() (le type MIME envoyé par le navigateur est peu fiable)
 }) : null;
+// [LUBA UPLOAD] Service d'upload unique (fichiers volumineux par morceaux), partagé par le cœur v17 et le module héritage.
+let _uploadService = null;
+function getUploadService() {
+  if (_uploadService) return _uploadService;
+  const mod = tryRequire("./luba-upload.js");
+  if (!mod) { logger.error("luba-upload.js introuvable ou invalide : les envois de fichiers par morceaux sont indisponibles"); return null; }
+  _uploadService = mod.createUploadService({ DIR: process.env.UPLOAD_DIR || path.join(path.dirname(CONFIG.PATHS.DB), "luba-uploads") });
+  _uploadService.startSweeper();
+  logger.info({ maxMb: _uploadService.CFG.MAX_FILE_BYTES / 1048576, dir: _uploadService.CFG.DIR }, "📎 Upload volumineux activé");
+  return _uploadService;
+}
 const chatUpload = (req, res, next) => (upload ? upload.any()(req, res, (err) => (err ? sendError(req, res, err) : next())) : next());
 
 const wantsStreaming = (req) => String(req.headers.accept || "").toLowerCase().includes("text/event-stream") || req.body?.stream === true || req.body?.stream === "true" || req.query.stream === "true";
@@ -5266,6 +5280,41 @@ async function chatHandler(req, res) {
     images = up.images.length ? up.images : null;
     docs = up.docs.length ? up.docs : null;
     rejected = up.rejected.length ? up.rejected : null;
+  }
+  // [LUBA UPLOAD] Pièces jointes déjà téléversées par morceaux (champ `attachments`) : relues sur disque, propres à CET utilisateur,
+  // puis traitées par les MÊMES extracteurs que les fichiers multipart (PDF, Word, Excel, PowerPoint, texte/code).
+  let rawAtt = req.body?.attachments;
+  if (typeof rawAtt === "string") { try { rawAtt = JSON.parse(rawAtt); } catch { rawAtt = null; } }
+  if (Array.isArray(rawAtt) && rawAtt.length) {
+    const svc = getUploadService();
+    const maxAtt = envInt("MAX_ATTACHMENTS", 8);
+    const docList = docs ? docs.slice() : [], rejList = rejected ? rejected.slice() : [];
+    let chars = docList.reduce((n, d) => n + (d.text || "").length, 0);
+    for (const a of rawAtt.slice(0, maxAtt)) {
+      const label = safeFileName(String(a?.name || "fichier"));
+      try {
+        if (!svc) throw new Error("service d'upload indisponible");
+        const f = await svc.readBuffer(req.userId, String(a?.conversationId || ""), String(a?.fileId || ""), { maxBytes: envInt("MAX_ATTACHMENT_EXTRACT_MB", 30) * 1048576 });
+        const file = { buffer: f.buffer, originalname: f.name };
+        const c = classifyUpload(file);
+        if (c.kind === "image") {
+          const all = (images || []);
+          if (all.length >= CONFIG.LIMITS.MAX_IMAGES_PER_REQUEST) { rejList.push({ name: label, reason: `maximum ${CONFIG.LIMITS.MAX_IMAGES_PER_REQUEST} images par message` }); continue; }
+          images = all.concat([await prepareImage({ buffer: f.buffer, mimetype: toImageMime(f.buffer) })]); continue;
+        }
+        if (c.kind === "legacy_office") { rejList.push({ name: label, reason: "ancien format Office : enregistre-le en .docx / .xlsx / .pptx" }); continue; }
+        if (c.kind === "unsupported" || c.kind === "empty") { rejList.push({ name: label, reason: c.kind === "empty" ? "fichier vide" : "format non pris en charge" }); continue; }
+        const d = await extractDocument(file, c.kind);
+        if (!d.text && !d.note) d.note = "aucun texte trouvé";
+        if (chars + d.text.length > CONFIG.LIMITS.MAX_DOC_TOTAL_CHARS) { d.text = d.text.slice(0, Math.max(0, CONFIG.LIMITS.MAX_DOC_TOTAL_CHARS - chars)); d.truncated = true; }
+        chars += d.text.length; docList.push(d);
+      } catch (e) {
+        rejList.push({ name: label, reason: e && e.code === "FILE_TOO_BIG_FOR_EXTRACT" ? "trop volumineux pour être lu par l'IA" : e && e.status === 404 ? "fichier introuvable (expiré ou supprimé), renvoie-le" : `lecture impossible (${String(e?.message || e).slice(0, 80)})` });
+      }
+    }
+    if (rawAtt.length > maxAtt) rejList.push({ name: `${rawAtt.length - maxAtt} fichier(s)`, reason: `maximum ${maxAtt} pièces jointes par message` });
+    docs = docList.length ? docList : null; rejected = rejList.length ? rejList : null;
+    if (!images && !docList.some((d) => d.text) && rejList.length) throw Errors.badRequest("UNSUPPORTED_FILE", `Je n'ai pas pu lire « ${rejList[0].name} » : ${rejList[0].reason}. Formats acceptés : ${FILE_KINDS_LABEL}.`);
   }
 
   let started;
@@ -5503,7 +5552,7 @@ function buildApp() {
   app.use(cors ? cors({
     origin: (origin, cb) => cb(null, !origin || ALLOWED_ORIGINS.includes(origin)),
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "X-Google-Access-Token", "X-Session-Token", "x-luba-signature", "x-luba-timestamp", "Accept", "Last-Event-ID", "Idempotency-Key"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "X-Google-Access-Token", "X-Session-Token", "x-luba-signature", "x-luba-timestamp", "Accept", "Last-Event-ID", "Idempotency-Key", "Content-Range"],
     exposedHeaders: ["X-Request-Id", "Retry-After", "RateLimit-Remaining"], credentials: true, maxAge: 86400
   }) : (req, res, next) => next());
   // L'API ne sert que du JSON / SSE : aucune ressource ne doit pouvoir être exécutée, intégrée ou mise en cache.
@@ -5586,7 +5635,7 @@ function buildApp() {
   }));
   app.delete("/api/conversations/:conversationId", auth, rateLimit("API"), wrap(async (req, res) => {
     const seq = await repo.deleteConversation(req.userId, req.params.conversationId);
-    try { await uploadService.deleteConversationFiles(req.userId, req.params.conversationId); } catch {}   // [LUBA UPLOAD] fichiers de la conversation
+    try { await getUploadService()?.deleteConversationFiles(req.userId, req.params.conversationId); } catch {}   // [LUBA UPLOAD] fichiers de la conversation
     bus.publish(`user:${req.userId}`, { type: "sync", seq });
     res.json({ success: true });
   }));
@@ -5642,6 +5691,7 @@ function buildApp() {
 
   app.delete("/api/account", auth, rateLimit("STRICT"), wrap(async (req, res) => {
     const uid = req.userId;
+    try { await getUploadService()?.deleteAllUserFiles(uid); } catch (e) { logger.warn({ err: e.message }, "suppression fichiers utilisateur"); }   // [LUBA UPLOAD]
     const sessions = await db.all("SELECT session_id FROM sessions WHERE user_id = ?", [uid]);
     await db.transaction(async (w) => {
       for (const s of sessions) await enqueueMirror(w, "session_delete", `s:${s.session_id}`, { session_id: s.session_id, user_id: uid });
@@ -5674,6 +5724,10 @@ function buildApp() {
   // ----- Routes non portées (voix, WhatsApp, intentions…) : ancien code, optionnel -----
   // [LUBA ENGINE] routes /api/engine/* (capacités, tâches d'analyse/correction, vérification, téléchargement). Échec = Milo continue.
   if (lubaEngine) { try { lubaEngine.mount(app, { auth, rateLimit, logger, llm: lubaEngineLlm }); } catch (e) { logger.error({ err: e.message }, "Luba Engine : montage des routes échoué (non bloquant)"); } }
+  { // [LUBA UPLOAD] /api/uploads*, /api/conversations/:id/files* — authentification v17, indépendant du module héritage
+    const svc = getUploadService();
+    if (svc) app.use(tryRequire("./luba-upload.js").createUploadRouter(express, auth, svc, { limiter: rateLimit("API") }));
+  }
   if (legacy?.app && envBool("LEGACY_MOUNT", true)) app.use(legacy.app);
 
   app.use((req, res) => sendError(req, res, Errors.notFound("NOT_FOUND", "Route introuvable.")));
@@ -14355,6 +14409,13 @@ const upload = multer({
   }
 });
 
+// [LUBA UPLOAD] Pièces jointes de /api/chat : mêmes limites que le cœur v17 (taille ET nombre), aucun filtre MIME (le navigateur le
+// renseigne mal) ; chaque fichier est classé par son CONTENU dans le gestionnaire (images → vision, documents → texte extrait).
+const uploadChat = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: CONFIG.LIMITS.MAX_FILE_SIZE_MB * 1024 * 1024, files: CONFIG.LIMITS.MAX_IMAGES_PER_REQUEST + CONFIG.LIMITS.MAX_FILES_PER_REQUEST }
+});
+
 const uploadAudio = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: CONFIG.AUDIO.MAX_SIZE_MB * 1024 * 1024 },
@@ -15015,7 +15076,11 @@ app.post(
   "/api/chat",
   chatLimiter,
   authenticateUser,
-  upload.array("images", CONFIG.LIMITS.MAX_IMAGES_PER_REQUEST),
+  (req, res, next) => uploadChat.any()(req, res, (e) => {
+    if (!e) return next();
+    const tooBig = e.code === "LIMIT_FILE_SIZE", tooMany = e.code === "LIMIT_FILE_COUNT" || e.code === "LIMIT_UNEXPECTED_FILE";
+    return res.status(tooBig || tooMany ? 413 : 400).json({ success: false, error: true, code: tooBig ? "FILE_TOO_LARGE" : tooMany ? "TOO_MANY_FILES" : "UPLOAD_ERROR", reply: tooBig ? `Fichier trop lourd (max ${CONFIG.LIMITS.MAX_FILE_SIZE_MB} Mo).` : tooMany ? "Trop de fichiers dans ce message." : "Envoi de fichier invalide." });
+  }),
   async (req, res) => {
     const isStream = wantsStreaming(req) && !(req.files && req.files.length > 0);
 
@@ -15097,12 +15162,28 @@ app.post(
 
       let imgs = null;
       if (req.files && req.files.length > 0) {
-        const bad = req.files.find((f) => !isValidImageSignature(f.buffer));
-        if (bad) {
-          return res.status(400).json({ success: false, error: true, reply: "Image invalide.", code: "INVALID_IMAGE_CONTENT" });
+        // Classement par contenu : les images vont à la vision, tout le reste passe par les extracteurs de documents du cœur v17.
+        const imgFiles = req.files.filter((f) => isValidImageSignature(f.buffer));
+        const otherFiles = req.files.filter((f) => !isValidImageSignature(f.buffer));
+        if (imgFiles.length > CONFIG.LIMITS.MAX_IMAGES_PER_REQUEST) {
+          return res.status(413).json({ success: false, error: true, reply: `Maximum ${CONFIG.LIMITS.MAX_IMAGES_PER_REQUEST} images par message.`, code: "TOO_MANY_FILES" });
         }
-        imgs = req.files.map((f) => convertImageToBase64(f.buffer, f.mimetype));
-        await incrementUserQuota(req.userId, "image");
+        if (otherFiles.length) {
+          if (!v17 || typeof v17.processUploads !== "function") {
+            return res.status(415).json({ success: false, error: true, reply: "Ce serveur ne sait lire que des images dans ce mode.", code: "UNSUPPORTED_FILE" });
+          }
+          try {
+            const up = await v17.processUploads(otherFiles);
+            const block = v17.docBlock(up.docs, up.rejected);
+            if (block) messageForLLM = messageForLLM + "\n\n" + block;
+          } catch (e) {
+            return res.status(400).json({ success: false, error: true, reply: e.message || "Fichier non pris en charge.", code: e.code || "UNSUPPORTED_FILE" });
+          }
+        }
+        if (imgFiles.length) {
+          imgs = imgFiles.map((f) => convertImageToBase64(f.buffer, f.mimetype));
+          await incrementUserQuota(req.userId, "image");
+        }
       }
 
       const gToken = req.headers["x-google-access-token"] || null;
@@ -15610,10 +15691,12 @@ app.delete("/api/account", strictLimiter, authenticateUser, async (req, res) => 
 
 // ---------- [LUBA UPLOAD] Fichiers volumineux (flux sur disque, morceaux reprenables) ----------
 const { createUploadService, createUploadRouter } = require("./luba-upload.js");
-const uploadService = createUploadService({ DIR: process.env.UPLOAD_DIR || path.join(path.dirname(CONFIG.PATHS.DB), "luba-uploads") });
-app.use(createUploadRouter(express, authenticateUser, uploadService, { limiter: apiLimiter }));
-uploadService.startSweeper();
-logger.info({ maxMb: uploadService.CFG.MAX_FILE_BYTES / 1048576, dir: uploadService.CFG.DIR }, "📎 Upload volumineux activé");
+const sharedUploads = v17 && v17.uploadService;            // cœur v17 : même service, routes déjà montées (aucun doublon)
+const uploadService = sharedUploads || createUploadService({ DIR: process.env.UPLOAD_DIR || path.join(path.dirname(CONFIG.PATHS.DB), "luba-uploads") });
+if (!sharedUploads) {                                       // exécution autonome du module héritage
+  app.use(createUploadRouter(express, authenticateUser, uploadService, { limiter: apiLimiter }));
+  uploadService.startSweeper();
+}
 
 // ---------- 404 ----------
 app.use((req, res) => {

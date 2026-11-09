@@ -313,6 +313,13 @@ function createUploadService(opts = {}) {
     throw err(422, "NOT_TEXT", "Contenu non lisible en texte.");
   }
 
+  // Fichier complet en mémoire (pour les extracteurs PDF/Word/Excel/PowerPoint), borné par maxBytes.
+  async function readBuffer(userId, convId, fileId, { maxBytes = 30 * 1048576 } = {}) {
+    const { meta, paths } = await getMeta(userId, convId, fileId);
+    if (meta.size > maxBytes) throw err(413, "FILE_TOO_BIG_FOR_EXTRACT", "Fichier trop volumineux pour être lu par l'IA.");
+    return { name: meta.name, size: meta.size, ext: meta.ext, mime: meta.mime, buffer: await fsp.readFile(paths.bin) };
+  }
+
   // ---------- Nettoyage périodique ----------
   async function sweep() {
     const now = Date.now();
@@ -341,7 +348,7 @@ function createUploadService(opts = {}) {
 
   function allowedExtensions() { return [...TEXT_EXT, ...Object.keys(BINARY_EXT)].sort(); }
 
-  return { CFG, init, status, append, abort, listFiles, deleteFile, deleteConversationFiles, deleteAllUserFiles, readText, sweep, startSweeper, stopSweeper, allowedExtensions, cleanName };
+  return { CFG, init, status, append, abort, listFiles, deleteFile, deleteConversationFiles, deleteAllUserFiles, readText, readBuffer, sweep, startSweeper, stopSweeper, allowedExtensions, cleanName };
 }
 
 // ---------- Routeur Express ----------
