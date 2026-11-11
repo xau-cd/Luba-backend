@@ -5728,6 +5728,14 @@ function buildApp() {
     const svc = getUploadService();
     if (svc) app.use(tryRequire("./luba-upload.js").createUploadRouter(express, auth, svc, { limiter: rateLimit("API") }));
   }
+  { // [LUBA ADMIN] module facultatif admin/admin.js : /api/admin/{analytics,users,conversations,runs,security,system,auth}* et /admin-ui. Échec = Milo continue.
+    const adminOff = /^(0|false|no|off)$/i.test(process.env.ADMIN_ENABLED || "");
+    const adminMod = adminOff ? null : tryRequire("./admin/admin.js");
+    if (adminMod) {
+      try { adminMod.mount(app, { express, auth, requireRole, rateLimit, wrap, Errors, db, repo, logger, CONFIG, USER_QUOTAS, FIREBASE_CONFIG, diagnostics, blockedIps, authFails, logSecurity }); }
+      catch (e) { logger.error({ err: e.message }, "LUBA ADMIN : montage échoué (non bloquant)"); }
+    } else if (!adminOff && fs.existsSync(path.join(__dirname, "admin", "admin.js"))) logger.warn("admin/admin.js présent mais non chargeable (erreur de syntaxe ?)");
+  }
   if (legacy?.app && envBool("LEGACY_MOUNT", true)) app.use(legacy.app);
 
   app.use((req, res) => sendError(req, res, Errors.notFound("NOT_FOUND", "Route introuvable.")));
