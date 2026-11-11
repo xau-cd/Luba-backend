@@ -556,8 +556,35 @@ async function execute(name, args = {}, _ctx = {}) {
   }
 }
 
+// ---------------------------------------------------------------------------------
+// §9 — Fournisseurs de RECHERCHE WEB (consommés par net.js via luba-net.js) : actualités + science
+//   Chaque fournisseur renvoie des lignes normalisables { title, url, snippet, publishedAt, author }.
+//   Un échec lève une erreur (jamais « 0 résultat » silencieux) : net.js l'enregistre comme fournisseur en échec.
+// ---------------------------------------------------------------------------------
+const WEB_PROVIDERS = {
+  googlenews: { tool: "search_google_news", topics: ["news"],
+    map: (r) => (r.articles || []).map((a) => ({ title: a.title, url: a.url, snippet: a.source ? `Source : ${a.source}` : "", publishedAt: a.publishedAt })) },
+  openalex: { tool: "search_openalex", topics: ["academic"],
+    map: (r) => (r.works || []).map((w) => ({ title: w.title, url: w.openAccessUrl || w.doi, snippet: [w.abstract, w.venue ? `Revue : ${w.venue}` : "", w.year ? `Année : ${w.year}` : ""].filter(Boolean).join(" — "), author: (w.authors || []).join(", ") || null })).filter((x) => x.url) },
+  crossref: { tool: "search_crossref", topics: ["academic"],
+    map: (r) => (r.works || []).map((w) => ({ title: w.title, url: w.url || (w.doi ? `https://doi.org/${w.doi}` : null), snippet: [w.journal ? `Revue : ${w.journal}` : "", w.year ? `Année : ${w.year}` : ""].filter(Boolean).join(" — "), author: (w.authors || []).join(", ") || null })).filter((x) => x.url) },
+  arxiv: { tool: "search_arxiv", topics: ["academic"],
+    map: (r) => (r.papers || []).map((p) => ({ title: p.title, url: p.url, snippet: p.summary, publishedAt: p.published, author: (p.authors || []).join(", ") || null })) }
+};
+function webProviders() {
+  const on = enabledSet();
+  return Object.entries(WEB_PROVIDERS).filter(([, p]) => TOOLS[p.tool] && on.has(p.tool)).map(([name, p]) => ({
+    name, topics: p.topics,
+    async search(q, o = {}) {
+      const r = await TOOLS[p.tool].exec({ query: q, limit: Math.min(o.maxResults || 5, 8) });
+      if (!r || r.success === false) throw new Error(r?.error || "échec du fournisseur");
+      return p.map(r);
+    }
+  }));
+}
+
 module.exports = {
-  VERSION: "1.0.0", SOURCES, TOOLS, schemas, has, execute,
+  VERSION: "1.1.0", SOURCES, TOOLS, schemas, has, execute, webProviders,
   names: () => Object.keys(TOOLS),
   // — réservé aux tests —
   __setFetch: (fn) => { doFetch = fn || ((...a) => globalThis.fetch(...a)); },
