@@ -1078,7 +1078,7 @@ function createProgrammer({ db, logger = console, sender = undefined, now = () =
     const route = (method, path, ...h) => app[method](base + path, ...h);
     const A = [auth, api];
     const body = (req) => (req.body && typeof req.body === "object" ? req.body : {});
-    const tzHeader = (req) => { const tz = req.headers?.["x-timezone"]; if (tz && req.userId) rememberTimezone(req.userId, String(tz)).catch(() => {}); };
+    const tzHeader = (req) => { const tz = req.query?.tz || req.headers?.["x-timezone"]; if (tz && req.userId) rememberTimezone(req.userId, String(tz).slice(0, 64)).catch(() => {}); };   // ?tz= : aucun en-tête CORS personnalisé nécessaire
 
     route("get", "/status", ...A, wrap(async (req, res) => {
       tzHeader(req);
