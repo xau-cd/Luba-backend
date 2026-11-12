@@ -110,6 +110,9 @@ const freeSources = /^(1|true|yes|on)$/i.test(process.env.DISABLE_FREE_SOURCES |
 const lubaNetMod = tryRequire("./luba-net.js");
 // [LUBA ENGINE] Bras et yeux de Luba (analyse/correction de fichiers, vérification de code) : actif dès que ./luba-engine.js existe ; ENGINE_ENABLED=false le désactive.
 const lubaEngine = /^(0|false|no|off)$/i.test(process.env.ENGINE_ENABLED || "") ? null : tryRequire("./luba-engine.js");
+// [LUBA PROGRAMMER] rappels / agenda / notifications Push. Module facultatif : s'il est absent ou invalide, Milo démarre normalement sans lui.
+const programmerMod = /^(0|false|no|off)$/i.test(process.env.PROGRAMMER_ENABLED || "") ? null : tryRequire("./programmer.js");
+let programmerSvc = null;
 
 const sleepRaw = (ms) => new Promise((r) => setTimeout(r, ms));
 const now = () => Date.now();
@@ -3263,7 +3266,13 @@ const NATIVE_TOOLS = {
   },
   create_task: {
     schema: { type: "function", function: { name: "create_task", description: "Crée une tâche / un rappel pour l'utilisateur.", parameters: { type: "object", properties: { title: { type: "string" }, notes: { type: "string" }, due_at: { type: "string", description: "Date ISO 8601 optionnelle" } }, required: ["title"] } } },
-    async exec(args, ctx) { const t = await repo.createTask(ctx.userId, { title: args.title, notes: args.notes, dueAt: parseDue(args.due_at) }); return { success: true, task: t }; }
+    async exec(args, ctx) {
+      const dueAt = parseDue(args.due_at);
+      const t = await repo.createTask(ctx.userId, { title: args.title, notes: args.notes, dueAt });
+      let reminder = null;   // [LUBA PROGRAMMER] pont : l'échéance déclenche aussi une vraie notification Push
+      if (programmerSvc && dueAt) { const ms = typeof dueAt === "number" ? dueAt : Date.parse(dueAt); try { reminder = await programmerSvc.createFromTask(ctx.userId, { title: args.title, notes: args.notes, dueAtMs: ms }); } catch (e) { logger.warn({ err: e.message }, "Luba Programmer : pont create_task ignoré"); } }
+      return { success: true, task: t, ...(reminder ? { push_reminder: { id: reminder.id, nextRunAt: reminder.nextRunAt } } : {}) };
+    }
   },
   list_tasks: {
     schema: { type: "function", function: { name: "list_tasks", description: "Liste les tâches de l'utilisateur.", parameters: { type: "object", properties: { status: { type: "string", enum: ["pending", "done"] } }, required: [] } } },
@@ -4490,6 +4499,22 @@ const chat = {
 
     try {
       emit.status("preparing", { language: run.language });
+      if (programmerSvc && !run.images?.length && !run.docs?.length) {   // [LUBA PROGRAMMER] intention explicite de rappel : enregistrée pour de vrai, jamais simulée
+        const prg = await settle(programmerSvc.handleChatMessage({ userId: run.userId, convId: run.convId, message: run.message, channel: run.channel || "web" }), 8000, null);
+        if (prg && prg.reply) {
+          emit.token(prg.reply);
+          if (speech) { const tail = speech.flush?.(); if (tail) run.token(tail); }
+          await repo.finalizeMessage({ userId: run.userId, convId: run.convId, idx: run.assistantIdx, content: prg.reply, status: "final",
+            metadata: { providerUsed: "luba-programmer", model: "programmer", tier: run.tier, intent: "REMINDER", language: run.language, elapsedMs: now() - startedAt, programmer: { action: prg.action, reminderId: prg.reminder?.id || null } } });
+          const result = { conversationId: run.convId, runId: run.id, messageId: msgKey(run.convId, run.assistantIdx), isNewConversation: Boolean(run.isNew), reply: prg.reply, text: prg.reply, error: false, degraded: false,
+            providerUsed: "luba-programmer", model: "programmer", modelTier: run.tier, visionEnabled: false, intent: "REMINDER", language: run.language, elapsedMs: now() - startedAt, queueMs: run.queueMs,
+            suggestions: [], sources: [], toolCallTrace: [], usage: { prompt: 0, completion: 0 }, images: [], media: { images: [], videos: [] }, programmer: { action: prg.action, reminder: prg.reminder || null } };
+          run.push("done", result);
+          run.finish("done", result);
+          repo.updateRun(run.id, { status: run.status, finished_at: now(), provider: "luba-programmer", model: "programmer", ttft_ms: 0, tokens_out: 0 }).catch(() => {});
+          return;
+        }
+      }
       const hasImages = Boolean(run.images && run.images.length);
       const pre = legacy?.preRouteIntent ? (() => { try { return legacy.preRouteIntent(run.message); } catch { return null; } })() : null;
       const intent = refineIntent(pre?.intent && pre.intent !== "GENERAL" ? pre.intent : quickIntent(run.message), run.message, { hasDocs: Boolean(run.docs?.length) });
@@ -4502,6 +4527,7 @@ const chat = {
       const wantsEnrich = !live && !imgReq && !["SMALLTALK", "CODE", "GENERAL", "WEBSITE", "DOCUMENT", "MATH"].includes(intent) && legacy?.enrichContextWithIntent;
 
       // Tout ce qui est facultatif est BORNÉ dans le temps et ne peut jamais bloquer la réponse.
+      const programmerBlockP = programmerSvc ? settle(programmerSvc.contextBlock(run.userId, { live }), 1200, "") : Promise.resolve("");   // [LUBA PROGRAMMER]
       const [ctxRows, memoryBlock, mod, enrichment] = await Promise.all([
         repo.getContext(run.convId, live ? 12 : CONFIG.LIMITS.MAX_CONTEXT_MESSAGES + 4),
         settle(repo.memoryBlock(run.userId), 1500, ""),
@@ -4531,6 +4557,7 @@ const chat = {
       const hist = buildHistory(ctxRows, run.userIdx, { live });
       const history = hist.messages;
       let system = (live ? LUBA_LIVE_SYSTEM : reconcileToolRouting(LUBA_SYSTEM_PROMPT, new Set(getToolSchemas().map((t) => t.function.name)))) + `\n\n[LANGUE DÉTECTÉE : ${run.language.toUpperCase()}] → Réponds en ${LANG_NAME[run.language] || "français"}.`;
+      { const pb = await programmerBlockP; if (pb) system += `\n\n${pb}`; }   // [LUBA PROGRAMMER]
       if (!live && intent === "WEBSITE") system += `\n\n${WEBSITE_PROMPT}`;
       else if (!live && intent === "CODE" && run.tier === "v250") system += `\n\n${CODE_PRO_PROMPT}`;
       if (!live && (run.docs?.length || intent === "DOCUMENT")) system += `\n\n${DOCUMENT_PROMPT}`;
@@ -5375,6 +5402,7 @@ async function chatHandler(req, res) {
     if (!images && !docList.some((d) => d.text) && rejList.length) throw Errors.badRequest("UNSUPPORTED_FILE", `Je n'ai pas pu lire « ${rejList[0].name} » : ${rejList[0].reason}. Formats acceptés : ${FILE_KINDS_LABEL}.`);
   }
 
+  if (programmerSvc && req.headers["x-timezone"]) programmerSvc.rememberTimezone(req.userId, String(req.headers["x-timezone"])).catch(() => {});
   let started;
   try {
     started = await chat.start({
@@ -5610,7 +5638,7 @@ function buildApp() {
   app.use(cors ? cors({
     origin: (origin, cb) => cb(null, !origin || ALLOWED_ORIGINS.includes(origin)),
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "X-Google-Access-Token", "X-Session-Token", "x-luba-signature", "x-luba-timestamp", "Accept", "Last-Event-ID", "Idempotency-Key", "Content-Range"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "X-Timezone", "X-Google-Access-Token", "X-Session-Token", "x-luba-signature", "x-luba-timestamp", "Accept", "Last-Event-ID", "Idempotency-Key", "Content-Range"],
     exposedHeaders: ["X-Request-Id", "Retry-After", "RateLimit-Remaining"], credentials: true, maxAge: 86400
   }) : (req, res, next) => next());
   // L'API ne sert que du JSON / SSE : aucune ressource ne doit pouvoir être exécutée, intégrée ou mise en cache.
@@ -5782,6 +5810,10 @@ function buildApp() {
   // ----- Routes non portées (voix, WhatsApp, intentions…) : ancien code, optionnel -----
   // [LUBA ENGINE] routes /api/engine/* (capacités, tâches d'analyse/correction, vérification, téléchargement). Échec = Milo continue.
   if (lubaEngine) { try { lubaEngine.mount(app, { auth, rateLimit, logger, llm: lubaEngineLlm }); } catch (e) { logger.error({ err: e.message }, "Luba Engine : montage des routes échoué (non bloquant)"); } }
+  if (programmerSvc) { // [LUBA PROGRAMMER] /api/programmer/* — authentification v17, même serveur Express, même base SQLite
+    try { programmerSvc.mount(app, { auth, rateLimit, wrap }); }
+    catch (e) { logger.error({ err: e.message }, "Luba Programmer : montage des routes échoué (non bloquant)"); }
+  }
   { // [LUBA UPLOAD] /api/uploads*, /api/conversations/:id/files* — authentification v17, indépendant du module héritage
     const svc = getUploadService();
     if (svc) app.use(tryRequire("./luba-upload.js").createUploadRouter(express, auth, svc, { limiter: rateLimit("API") }));
@@ -5833,6 +5865,10 @@ async function bootstrap({ listen = true } = {}) {
   initSupabase();
   await db.open();
   await repo.recoverOrphans();
+  if (programmerMod) {   // [LUBA PROGRAMMER] crée ses tables dans LA MÊME base, démarre le scheduler ; une erreur désactive le module, jamais Milo
+    try { const svc = programmerMod.createProgrammer({ db, logger, Errors }); if (await svc.start()) programmerSvc = svc; }
+    catch (e) { logger.error({ err: e.message }, "Luba Programmer : initialisation échouée (Milo continue sans lui)"); }
+  } else if (!/^(0|false|no|off)$/i.test(process.env.PROGRAMMER_ENABLED || "") && fs.existsSync(path.join(__dirname, "programmer.js"))) logger.warn("programmer.js présent mais non chargeable (erreur de syntaxe ?)");
   await loadBlockedIps();
   await bus.attachRedis(process.env.REDIS_URL);
   legacy = loadLegacy();
@@ -5899,6 +5935,7 @@ async function shutdown(signal, code = 0) {
     mirrorWorker.stop();
     try { await legacy?.baileysManager?.destroyAll(); } catch {}
     for (const t of timers) clearInterval(t);
+    try { programmerSvc?.stop(); } catch {}      // [LUBA PROGRAMMER] arrête le scheduler (les envois en cours sont repris au redémarrage)
     try { await lubaEngine?.shutdown(); } catch {}      // [LUBA ENGINE] annule les tâches, nettoie les espaces temporaires
     await bus.close();
     await db.close();
