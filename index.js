@@ -113,6 +113,7 @@ const lubaEngine = /^(0|false|no|off)$/i.test(process.env.ENGINE_ENABLED || "") 
 // [LUBA PROGRAMMER] rappels / agenda / notifications Push. Module facultatif : s'il est absent ou invalide, Milo démarre normalement sans lui.
 const programmerMod = /^(0|false|no|off)$/i.test(process.env.PROGRAMMER_ENABLED || "") ? null : tryRequire("./programmer.js");
 let programmerSvc = null;
+let programmerInitError = null;   // raison lisible si le module n'est pas actif (affichée par /api/programmer/* au lieu d'un 404 muet)
 
 const sleepRaw = (ms) => new Promise((r) => setTimeout(r, ms));
 const now = () => Date.now();
@@ -1405,6 +1406,7 @@ const repo = {
     if (summary?.summary) lines.push(`Résumé : ${summary.summary.slice(0, 800)}`);
     for (const f of facts) lines.push(`- (${f.category}) ${f.fact}`);
     for (const f of ltm) lines.push(`- ${f.key} : ${f.value}`);
+    if (programmerSvc) { try { lines.push(...await programmerSvc.memoryLines(userId)); } catch {} }   // [LUBA PROGRAMMER] l'agenda fait partie de la mémoire de Luba (Chat, Live, WhatsApp)
     return lines.length ? `[MÉMOIRE SUR CET UTILISATEUR]\n${lines.join("\n")}` : "";
   },
 
@@ -5812,7 +5814,12 @@ function buildApp() {
   if (lubaEngine) { try { lubaEngine.mount(app, { auth, rateLimit, logger, llm: lubaEngineLlm }); } catch (e) { logger.error({ err: e.message }, "Luba Engine : montage des routes échoué (non bloquant)"); } }
   if (programmerSvc) { // [LUBA PROGRAMMER] /api/programmer/* — authentification v17, même serveur Express, même base SQLite
     try { programmerSvc.mount(app, { auth, rateLimit, wrap }); }
-    catch (e) { logger.error({ err: e.message }, "Luba Programmer : montage des routes échoué (non bloquant)"); }
+    catch (e) { programmerInitError = `montage des routes échoué : ${e.message}`; logger.error({ err: e.message }, "Luba Programmer : montage des routes échoué (non bloquant)"); }
+  }
+  if (!programmerSvc || programmerInitError) {   // [LUBA PROGRAMMER] module indisponible : réponse EXPLICITE (503 + raison) plutôt qu'un 404 trompeur
+    const unavailable = (req, res) => res.status(503).json({ success: false, error: true, code: "PROGRAMMER_UNAVAILABLE", message: `Luba Programmer indisponible sur le serveur : ${programmerInitError || "non initialisé"}.` });
+    app.get("/api/programmer/ping", unavailable);
+    app.use("/api/programmer", auth, unavailable);
   }
   { // [LUBA UPLOAD] /api/uploads*, /api/conversations/:id/files* — authentification v17, indépendant du module héritage
     const svc = getUploadService();
@@ -5866,9 +5873,10 @@ async function bootstrap({ listen = true } = {}) {
   await db.open();
   await repo.recoverOrphans();
   if (programmerMod) {   // [LUBA PROGRAMMER] crée ses tables dans LA MÊME base, démarre le scheduler ; une erreur désactive le module, jamais Milo
-    try { const svc = programmerMod.createProgrammer({ db, logger, Errors }); if (await svc.start()) programmerSvc = svc; }
-    catch (e) { logger.error({ err: e.message }, "Luba Programmer : initialisation échouée (Milo continue sans lui)"); }
-  } else if (!/^(0|false|no|off)$/i.test(process.env.PROGRAMMER_ENABLED || "") && fs.existsSync(path.join(__dirname, "programmer.js"))) logger.warn("programmer.js présent mais non chargeable (erreur de syntaxe ?)");
+    try { const svc = programmerMod.createProgrammer({ db, logger, Errors }); if (await svc.start()) programmerSvc = svc; else programmerInitError = "désactivé (PROGRAMMER_ENABLED=false)"; }
+    catch (e) { programmerInitError = `initialisation échouée : ${e.message}`; logger.error({ err: e.message }, "Luba Programmer : initialisation échouée (Milo continue sans lui)"); }
+  } else if (/^(0|false|no|off)$/i.test(process.env.PROGRAMMER_ENABLED || "")) programmerInitError = "désactivé (PROGRAMMER_ENABLED=false)";
+  else { programmerInitError = fs.existsSync(path.join(__dirname, "programmer.js")) ? "programmer.js présent mais non chargeable (erreur de syntaxe ou module manquant)" : "programmer.js absent du serveur (fichier non déployé)"; logger.error(programmerInitError); }
   await loadBlockedIps();
   await bus.attachRedis(process.env.REDIS_URL);
   legacy = loadLegacy();

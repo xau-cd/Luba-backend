@@ -962,6 +962,16 @@ function createProgrammer({ db, logger = console, sender = undefined, now = () =
       `Ne les répète jamais dans une autre conversation ni à un tiers.]\n${lines.join("\n")}`;
   }
 
+  /** Mémoire de Luba : agenda des 7 prochains jours, calculé À LA VOLÉE depuis la base (source unique : jamais de copie périmée,
+   *  rien à nettoyer quand un rappel est terminé ou supprimé). Injecté dans le bloc mémoire de TOUS les canaux (Chat, Live, WhatsApp). */
+  async function memoryLines(userId) {
+    if (!CFG.ENABLED || !state.started || !userId) return [];
+    const t = now();
+    const rows = await wall(`SELECT title, next_run_at, tz, rrule FROM programmer_reminders WHERE user_id = ? AND status IN ('scheduled','overdue') AND next_run_at IS NOT NULL
+                             AND next_run_at BETWEEN ? AND ? ORDER BY next_run_at LIMIT 8`, [userId, t - DAY, t + 7 * DAY]);
+    return rows.map((r) => `- Rappel programmé : ${sanitizeText(r.title, 120).replace(/[\[\]\n]/g, " ")} — ${fmtWhen(r.next_run_at, r.tz, t)}${r.rrule ? " (récurrent)" : ""}`);
+  }
+
   // ---------- Chat & Live ----------
   const pendingGet = async (userId) => { const r = await wget("SELECT * FROM programmer_pending WHERE user_id = ?", [userId]); if (!r) return null; if (r.expires_at < now()) { await wrun("DELETE FROM programmer_pending WHERE user_id = ?", [userId]); return null; } return { convId: r.conv_id, draft: parseJson(r.draft, null) }; };
   const pendingSet = (userId, convId, draft) => wrun("INSERT INTO programmer_pending (user_id, conv_id, draft, expires_at) VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET conv_id = excluded.conv_id, draft = excluded.draft, expires_at = excluded.expires_at", [userId, convId || null, JSON.stringify(draft), now() + CFG.PENDING_TTL_MS]);
@@ -1080,6 +1090,8 @@ function createProgrammer({ db, logger = console, sender = undefined, now = () =
     const body = (req) => (req.body && typeof req.body === "object" ? req.body : {});
     const tzHeader = (req) => { const tz = req.query?.tz || req.headers?.["x-timezone"]; if (tz && req.userId) rememberTimezone(req.userId, String(tz).slice(0, 64)).catch(() => {}); };   // ?tz= : aucun en-tête CORS personnalisé nécessaire
 
+    // Public, sans donnée utilisateur : permet de vérifier depuis un navigateur que le module est bien déployé et démarré.
+    route("get", "/ping", api, wrap(async (req, res) => res.json({ success: true, module: "luba-programmer", version: VERSION, started: state.started, scheduler: { mode: CFG.MODE, lastTickAt: state.lastTickAt ? new Date(state.lastTickAt).toISOString() : null, lastError: state.lastError }, push: { configured: Boolean(getSender()) } })));
     route("get", "/status", ...A, wrap(async (req, res) => {
       tzHeader(req);
       res.json({ success: true, version: VERSION, serverTime: new Date().toISOString(), scheduler: { mode: CFG.MODE, lastTickAt: state.lastTickAt ? new Date(state.lastTickAt).toISOString() : null, lastError: state.lastError }, push: await pushStatus(req.userId), settings: await getSettings(req.userId) });
@@ -1141,7 +1153,7 @@ function createProgrammer({ db, logger = console, sender = undefined, now = () =
 
   return {
     CFG, start, stop, tick, mount, migrate: () => migrate(db), state,
-    createReminder, updateReminder, completeReminder, deleteReminder, listReminders, getDetails, agenda,
+    createReminder, updateReminder, completeReminder, deleteReminder, listReminders, getDetails, agenda, memoryLines,
     getSettings, saveSettings, rememberTimezone, saveSubscription, removeSubscription, pushStatus, pushTo,
     handleChatMessage, contextBlock, createFromTask, applyTimezoneToReminders, present
   };
