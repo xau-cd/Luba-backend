@@ -5671,7 +5671,7 @@ function buildApp() {
   const authStream = authenticate({ allowQueryToken: true });
 
   // ----- Publiques -----
-  app.get("/", (_req, res) => res.json({ name: "Luba AI Pro", version: CONFIG.VERSION, company: "HIKLON TECHNOLOGIES", status: "ok" }));
+  app.get("/", (_req, res) => res.json({ name: "Luba AI Pro", version: CONFIG.VERSION, company: "HIKLON TECHNOLOGIES", status: "ok", programmer: programmerSvc ? { active: true, version: programmerMod.VERSION } : { active: false, reason: programmerInitError || "non initialisé" } }));   // [LUBA PROGRAMMER] preuve de déploiement lisible sans authentification
   app.get("/api/health", wrap(async (req, res) => {
     // `status` = le SERVEUR (reste « ok » même si les fournisseurs LLM sont en panne : c'est ce que regarde Render) ; `llm` = fournisseurs externes.
     const base = { status: runManager.draining ? "draining" : "ok", version: CONFIG.VERSION, uptimeS: Math.round(process.uptime()), llm: llmHealthSummary() };
