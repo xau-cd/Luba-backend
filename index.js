@@ -9569,6 +9569,8 @@ async function synthesizePiper(text, { voice = "fr_FR-siwis-medium", speed = 1.0
   }
 }
 
+const lubaVoice = require("./luba-voice");
+
 async function synthesizeSpeech(text, options = {}) {
   if (!text || !text.trim()) return { success: false, error: "Texte vide" };
 
@@ -9581,13 +9583,24 @@ async function synthesizeSpeech(text, options = {}) {
     .replace(/\n{2,}/g, ". ")
     .trim();
 
+  // 1) Gemini TTS (clé dédiée GEMINI_TTS_API_KEY) — bascule auto si échecs répétés
+  try {
+    const g = await lubaVoice.synthesizeGemini(clean, {
+      geminiVoice: options.geminiVoice,
+      language: options.language || (/^en/i.test(String(options.voice || "")) || /^[ab][fm]_/.test(String(options.voice || "")) ? "en" : "fr")
+    });
+    if (g.success) return g;
+  } catch {}
+
+  // 2) Moteurs serveur de secours
   const k = await synthesizeKokoro(clean, options);
   if (k.success) return k;
 
   const p = await synthesizePiper(clean, { ...options, voice: options.piperVoice || process.env.PIPER_VOICE || "fr_FR-siwis-medium" });
   if (p.success) return p;
 
-  return { success: false, error: "Aucun moteur TTS disponible" };
+  // 3) Aucun moteur serveur : le client doit utiliser la voix système (speechSynthesis)
+  return { success: false, error: "Aucun moteur TTS disponible", fallback: "system" };
 }
 
 // ================================================================================
@@ -15583,8 +15596,9 @@ app.post("/api/voice/tts", apiLimiter, authenticateUser, async (req, res) => {
     if (!text) return res.status(400).json({ success: false, error: true, code: "MISSING_TEXT" });
 
     const r = await synthesizeSpeech(text, { voice: voice || "af_bella" });
-    if (!r.success) return res.status(503).json({ success: false, error: true, reply: r.error });
+    if (!r.success) return res.status(503).json({ success: false, error: true, reply: r.error, fallback: "system", text: String(text) });
 
+    res.setHeader("X-TTS-Provider", r.provider || "unknown");
     res.setHeader("Content-Type", r.format === "wav" ? "audio/wav" : "audio/mpeg");
     return res.send(r.audio);
   } catch {
@@ -16024,6 +16038,9 @@ async function handleLiveTurn(ws, state, userText) {
         const t = await synthesizeSpeech(s, { voice: liveVoice });
         if (t.success && !state.interrupted && ws.readyState === 1) {
           ws.send(encodeFrame(WS_FRAME.AUDIO_OUT, t.audio));
+        } else if (!t.success && t.fallback === "system" && !state.interrupted && ws.readyState === 1) {
+          // le client lit cette phrase avec la voix système (speechSynthesis)
+          ws.send(encodeFrame(WS_FRAME.STATUS, { stage: "tts_fallback", text: s }));
         }
       } catch {}
     }

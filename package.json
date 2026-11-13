@@ -10,7 +10,7 @@
   },
   "scripts": {
     "start": "node index.js",
-    "check": "node --check index.js && node --check worker.js && node --check net.js && node --check luba-net.js && node --check luba-engine.js && node --check luba-llm-gestionnaire.js && node --check llm-operation-budget.js && node --check luba-upload.js",
+    "check": "node --check index.js && node --check worker.js && node --check net.js && node --check luba-net.js && node --check luba-engine.js && node --check luba-llm-gestionnaire.js && node --check llm-operation-budget.js && node --check luba-upload.js && node --check luba-voice.js",
     "test": "node --test test/*.test.js",
     "test:modules": "node --test test/modular-architecture.test.js test/llm-operation-budget.test.js test/web-security.test.js",
     "check:python": "python3 -m py_compile luba_worker.py",
