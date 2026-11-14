@@ -10,8 +10,8 @@
 const core = require('./net.js');
 
 /** Transforme une fonction `(q, n) => Promise<résultats>` en fournisseur net.js. `topics` : general | news | academic | official. */
-function wrapEngine(name, fn, { topics = ['general'] } = {}) {
-  return { name, topics, search: async (q, o = {}) => {
+function wrapEngine(name, fn, { topics = ['general'], priority } = {}) {
+  return { name, topics, priority, search: async (q, o = {}) => {
     const out = await fn(q, o.maxResults || 6);
     const rows = Array.isArray(out) ? out : out?.results;
     if (!Array.isArray(rows)) throw new Error('réponse fournisseur invalide');

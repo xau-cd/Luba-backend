@@ -37,6 +37,7 @@ function createLubaNet(options = {}) {
   const maxSources = bounded(options.maxSources, 12, 1, 30);
   const maxQueries = bounded(options.maxQueries, 4, 1, 10);
   const cacheTtlMs = bounded(options.cacheTtlMs, 60000, 0, 3600000);
+  const hedgeMs = bounded(options.hedgeMs, 1200, 0, 10000);   // mode rapide : si le 1er moteur tarde au-delà, le suivant démarre en parallèle (0 = séquentiel)
   const cache = new Map();
 
   // ---------- recherche ----------
@@ -76,13 +77,9 @@ function createLubaNet(options = {}) {
     }
 
     if (strategy === 'fallback') {
-      // faible latence : on s'arrête au premier fournisseur qui renvoie des résultats
-      for (const p of selected) {
-        if (opts.signal?.aborted) throw new NetError('ABORTED', 'Recherche annulée.', { status: 499 });
-        const r = await callProvider(p, queries[0]);
-        record(r, queries[0]);
-        if (r.ok && r.results.length) break;
-      }
+      // faible latence : premier fournisseur qui renvoie des résultats ; s'il tarde (> hedgeMs) ou échoue, le suivant prend le relais
+      const done = await hedgedFallback(selected, p => callProvider(p, queries[0]), bounded(opts.hedgeMs, hedgeMs, 0, 10000), opts.signal);
+      done.forEach(r => record(r, queries[0]));
     } else {
       // 1re requête : tous les fournisseurs retenus ; requêtes suivantes : 2 fournisseurs généraux qui ont répondu (pas d'appels inutiles)
       const first = await Promise.all(selected.map(p => callProvider(p, queries[0])));
@@ -259,6 +256,7 @@ const RE_RECENT = /\b(dernier|derniere|dernieres|derniers|recent|recente|recents
 const RE_NEWS = /\b(actualites?|news|breaking|dernieres? (?:nouvelles|infos?|informations?)|aujourd'?hui|cette semaine|hier|elections?|guerre|accord|sommet|annonce[rd]?)\b/;
 const RE_ACADEMIC = /\b(etudes?|recherches?|scientifiques?|science|article|papers?|publications?|arxiv|doi|journal|revue|meta-?analyses?|clinique|essais? cliniques?|peer[- ]review|preuves?|evidence|these)\b/;
 const RE_OFFICIAL = /\b(officiel|officielle|loi|decret|reglement|reglementation|gouvernement|ministere|rapport|statistiques?|oms|onu|banque mondiale|fmi|official|regulation|law|government|report|statistics)\b/;
+const RE_TECH = /\b(code|bug|erreur|error|exception|stack ?overflow|github|npm|pip|python|javascript|typescript|nodejs|node\.js|react|vue|api|sql|docker|linux|kubernetes|framework|librairie|library|bibliotheque|compiler|regex|css|html|rust|golang|php|android|flutter|firebase|programmation|programming|open ?source)\b/;
 const RE_COMPARE = /\b(vs\.?|versus|comparer|comparaison|compare|differences?|mieux que|plutot que|difference between)\b/;
 const RE_VERIFY = /\b(verifier|verifie|verification|est-ce vrai|vrai ou faux|fiable|controversee?|contradiction|fake|rumeur|fact-?check|confirmer|confirme|confirmation)\b/;
 
@@ -283,6 +281,7 @@ function planResearch(query, opts = {}) {
   if (RE_NEWS.test(nq)) topics.push('news');
   if (RE_ACADEMIC.test(nq)) topics.push('academic');
   if (RE_OFFICIAL.test(nq)) topics.push('official');
+  if (RE_TECH.test(nq)) topics.push('tech');
 
   // décomposition en sous-requêtes (comparaison, questions multiples) + variantes ciblées
   const queries = [q];
@@ -302,9 +301,30 @@ function planResearch(query, opts = {}) {
   return { complexity, needsRecent, topics: uniq(topics), queries: uniq(queries).slice(0, maxQ), refineQueries, openTarget };
 }
 
+/** Exécute les fournisseurs en « relais couvert » : démarre le suivant si le courant échoue, répond vide, ou dépasse hedgeMs. S'arrête au premier résultat non vide. */
+async function hedgedFallback(selected, run, hedgeMs, signal) {
+  const finished = []; const inflight = new Set(); let started = 0;
+  if (!selected.length) return finished;
+  const start = () => { const t = run(selected[started++]).then(r => { finished.push(r); inflight.delete(t); return r; }); inflight.add(t); };
+  start();
+  for (;;) {
+    if (signal?.aborted) throw new NetError('ABORTED', 'Recherche annulée.', { status: 499 });
+    const waiters = [...inflight]; let timer = null;
+    if (started < selected.length && hedgeMs > 0) waiters.push(new Promise(res => { timer = setTimeout(() => res(null), hedgeMs); }));
+    const got = await Promise.race(waiters);
+    clearTimeout(timer);
+    if (got === null) { start(); continue; }
+    if (got.ok && got.results.length) break;
+    if (!inflight.size) { if (started < selected.length) start(); else break; }
+  }
+  return finished;
+}
+
 function pickProviders(all, { strategy, topics }) {
-  const general = all.filter(p => !Array.isArray(p.topics) || p.topics.includes('general'));
-  const topical = all.filter(p => Array.isArray(p.topics) && !p.topics.includes('general') && p.topics.some(t => topics.includes(t)));
+  // `priority` (plus petit = d'abord ; défaut 50) : en mode rapide, les moteurs fiables passent avant ceux qu'un serveur se fait souvent bloquer
+  const byPriority = (a, b) => (Number.isFinite(a.priority) ? a.priority : 50) - (Number.isFinite(b.priority) ? b.priority : 50);
+  const general = all.filter(p => !Array.isArray(p.topics) || p.topics.includes('general')).sort(byPriority);
+  const topical = all.filter(p => Array.isArray(p.topics) && !p.topics.includes('general') && p.topics.some(t => topics.includes(t))).sort(byPriority);
   return strategy === 'fallback' ? [...topical.filter(p => p.topics.includes('news') && topics.includes('news')), ...general] : [...general, ...topical];
 }
 
