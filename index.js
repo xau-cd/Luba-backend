@@ -9604,9 +9604,14 @@ async function transcribeAudioGemini(buffer, mimetype) {
   }
 }
 
+// STT_ENGINE=local (défaut) : le serveur NE transcrit PAS l'audio (ni Groq, ni Gemini) ; le téléphone/navigateur transcrit et envoie du texte (TEXT_IN).
+// STT_ENGINE=server : transcription serveur (Groq Whisper → Deepgram → Gemini en renfort).
+const sttLocalOnly = () => String(process.env.STT_ENGINE || "local").trim().toLowerCase() !== "server";
+
 /** Transcription : comme avant (Groq Whisper, puis Deepgram). Gemini n'intervient qu'en RENFORT, si Groq ET Deepgram ont échoué.
  *  Une transcription vide (silence) n'est jamais « corrigée » par Gemini : il aurait tendance à inventer du texte. */
 async function transcribeAudio(buffer, filename, mimetype) {
+  if (sttLocalOnly()) return { success: false, fallback: "local", error: "Transcription serveur désactivée : utiliser la reconnaissance vocale de l'appareil (STT_ENGINE=local)." };
   const r = await transcribeAudioGroq(buffer, filename, mimetype);
   if (r.success) return r;
   const g = await transcribeAudioGemini(buffer, mimetype).catch(() => ({ success: false }));
@@ -9633,7 +9638,7 @@ class StreamingSTT {
   }
 
   async _transcribePartial(mimetype) {
-    if (!this.buffer.length) return;
+    if (!this.buffer.length || sttLocalOnly()) return;
     try {
       const merged = Buffer.concat(this.buffer);
       const r = await transcribeAudioGroq(merged, "chunk.webm", mimetype);
@@ -15731,6 +15736,7 @@ app.post("/api/voice/transcribe", apiLimiter, authenticateUser, uploadAudio.sing
     if (!q.allowed) return res.status(429).json({ success: false, error: true, reply: q.message, code: "QUOTA_EXCEEDED" });
 
     const r = await transcribeAudio(req.file.buffer, req.file.originalname, req.file.mimetype);
+    if (!r.success && r.fallback === "local") return res.status(422).json({ success: false, error: true, reply: "Utilise la reconnaissance vocale de l'appareil.", code: "USE_LOCAL_STT", fallback: "local" });
     if (!r.success) return res.status(502).json({ success: false, error: true, reply: "Transcription indisponible.", code: "TRANSCRIPTION_FAILED" });
     return res.json({ success: true, error: false, text: sanitizeForLLM(r.text, 5000), provider: r.provider });
   } catch {
@@ -16151,6 +16157,7 @@ async function handleLiveFrame(ws, state, frame) {
   if (type === WS_FRAME.END_TURN) {
     if (!state.stt) return;
     const r = await state.stt.finalize("audio/webm");
+    if (!r.success && r.fallback === "local") { if (ws.readyState === 1) ws.send(encodeFrame(WS_FRAME.STATUS, { stage: "stt_local_only", message: "Le serveur ne transcrit pas l'audio : utilise la reconnaissance vocale de l'appareil et envoie le texte (TEXT_IN)." })); return; }
     if (r.success && r.text) {
       ws.send(encodeFrame(WS_FRAME.TRANSCRIPT, { text: r.text, partial: false }));
       await handleLiveTurn(ws, state, r.text);
