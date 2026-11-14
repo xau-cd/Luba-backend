@@ -1,12 +1,12 @@
 "use strict";
 // ================================================================================
-// LUBA PROGRAMMER v1.0.0 — rappels, agenda et notifications Push pour LUBA AI
+// LUBA PROGRAMMER v1.1.0 — rappels, agenda et notifications Push pour LUBA AI
 // HIKLON TECHNOLOGIES · module branché sur le serveur Express / la base SQLite EXISTANTS (aucun 2e serveur, aucune 2e base).
 //
 //   §1 Utilitaires & fuseaux horaires      §5 Analyse du français (Chat / Live)
 //   §2 Récurrences                         §6 Web Push (web-push, VAPID)
 //   §3 Schéma (migration idempotente)      §7 Scheduler (idempotent, reprise, relances)
-//   §4 Service (CRUD, contexte, chat)      §8 Routes HTTP  /api/programmer/*
+//   §4 Service (CRUD, contexte, chat)      §8 Routes HTTP  /api/programmer/*      §9 Outils IA (consulter/modifier/supprimer)
 //
 // Un « envoi » n'est JAMAIS présumé : chaque notification a un état (pending → sending → sent | failed | missed | skipped |
 // undelivered). « sent » = accepté par le service Push (HTTP 2xx) ; la remise finale à l'appareil dépend de ce service.
@@ -15,7 +15,7 @@
 const crypto = require("crypto");
 const net = require("net");
 
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const MIGRATION_ID = "005_programmer_v1";
 const DAY = 86400000;
 const MIN = 60000;
@@ -553,6 +553,26 @@ function makeWebPushSender(logger) {
 // §4 / §7 / §8 — SERVICE, SCHEDULER, ROUTES
 // ================================================================================
 
+// ================================================================================
+// §9 — OUTILS IA : l'assistant consulte / crée / modifie / termine / supprime les VRAIS rappels (mêmes lignes que l'interface)
+// ================================================================================
+const RECURRENCE_SCHEMA = { type: "object", description: "Récurrence : { freq: daily|weekly|monthly|yearly, interval (1 par défaut), byday: [1-7] (1=lundi … 7=dimanche, pour weekly), bymonthday: 1-31 (monthly), until: 'AAAA-MM-JJ' }. null = pas de récurrence.", properties: { freq: { type: "string", enum: FREQS }, interval: { type: "integer" }, byday: { type: "array", items: { type: "integer" } }, bymonthday: { type: "integer" }, until: { type: "string" } } };
+const TOOL_SCHEMAS = [
+  { type: "function", function: { name: "reminders_list", description: "Consulte les VRAIS rappels / notifications programmés de l'utilisateur (Luba Programmer). À appeler AVANT toute modification, fin ou suppression pour obtenir l'`id` exact, et pour répondre à « quels sont mes rappels ? ». Renvoie aussi la date/heure locale actuelle et le fuseau.", parameters: { type: "object", properties: { status: { type: "string", enum: ["active", "done", "all"], description: "active par défaut" }, query: { type: "string", description: "Mots à chercher dans le titre ou la description (optionnel)" }, limit: { type: "integer" } }, required: [] } } },
+  { type: "function", function: { name: "reminder_create", description: "Crée un VRAI rappel avec notification Push sur l'appareil de l'utilisateur. Donne soit `date` + `time` (heure locale de l'utilisateur), soit `in_minutes` pour « dans 30 minutes ».", parameters: { type: "object", properties: { title: { type: "string", maxLength: 200 }, date: { type: "string", description: "AAAA-MM-JJ (heure locale de l'utilisateur)" }, time: { type: "string", description: "HH:MM, 24 h" }, in_minutes: { type: "integer", description: "Alternative à date+time : dans N minutes (1 à 10080)" }, recurrence: RECURRENCE_SCHEMA, lead_minutes: { type: "array", items: { type: "integer" }, description: "Préavis supplémentaires en minutes avant l'heure (ex. [10, 60])" }, description: { type: "string", maxLength: 2000 }, icon: { type: "string", enum: ICONS } }, required: ["title"] } } },
+  { type: "function", function: { name: "reminder_update", description: "Modifie un rappel existant (titre, date, heure, récurrence, préavis, description, icône). N'envoie que les champs à changer. Uniquement si l'utilisateur le demande explicitement dans son dernier message. `reminder_id` vient de `reminders_list`.", parameters: { type: "object", properties: { reminder_id: { type: "string" }, title: { type: "string" }, date: { type: "string", description: "AAAA-MM-JJ" }, time: { type: "string", description: "HH:MM" }, recurrence: RECURRENCE_SCHEMA, lead_minutes: { type: "array", items: { type: "integer" } }, description: { type: "string" }, icon: { type: "string", enum: ICONS } }, required: ["reminder_id"] } } },
+  { type: "function", function: { name: "reminder_complete", description: "Marque un rappel comme terminé (un rappel récurrent passe à l'occurrence suivante). `reminder_id` vient de `reminders_list`.", parameters: { type: "object", properties: { reminder_id: { type: "string" } }, required: ["reminder_id"] } } },
+  { type: "function", function: { name: "reminder_delete", description: "Supprime DÉFINITIVEMENT un rappel et ses notifications en attente. Uniquement si l'utilisateur le demande explicitement dans son dernier message ; si plusieurs rappels correspondent, demande lequel. `reminder_id` vient de `reminders_list`.", parameters: { type: "object", properties: { reminder_id: { type: "string" } }, required: ["reminder_id"] } } }
+];
+// Garde-fou côté SERVEUR (indépendant du modèle) : une action qui modifie ou détruit n'est exécutée que si le DERNIER message de l'utilisateur
+// la demande, ou s'il répond brièvement à une question de confirmation. Un texte lu sur le web ou dans un document ne peut donc pas déclencher une suppression.
+const TOOL_INTENT = {
+  reminder_update: /\b(modifi|chang|d[ée]cal|repouss|avanc|report|remplac|renomm|corrig|mets|met\b|mettre|passe|ajout|enl[eè]ve|retire|update|edit|move|reschedul|rename)/i,
+  reminder_complete: /\b(termin|fini|fait\b|compl[eè]t|coch|valid|done|finish|complete)/i,
+  reminder_delete: /\b(supprim|efface|annul|retir|enl[eè]ve|d[ée]truis|vide|delete|remove|cancel|clear)/i
+};
+const AFFIRM_RE = /^\s*(oui|ouais|ok|okay|d'accord|dac|confirme|je confirme|vas-y|go|yes|yep|sure|bien s[ûu]r|exact|c'est bon|le (premier|deuxi[èe]me|second|dernier|troisi[èe]me)|la (premi[èe]re|deuxi[èe]me|seconde|derni[èe]re|troisi[èe]me)|celui|celle|[1-9]\b)/i;
+
 const parseJson = (s, d) => { try { const v = JSON.parse(s); return v ?? d; } catch { return d; } };
 const sanitizeText = (s, max) => String(s ?? "").replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "").replace(/[\u200B-\u200F\u202A-\u202E\u2066-\u2069]/g, "").trim().slice(0, max);
 
@@ -876,7 +896,7 @@ function createProgrammer({ db, logger = console, sender = undefined, now = () =
 
   async function dispatch(nowMs, stats) {
     await wrun("UPDATE programmer_notifications SET status = 'pending' WHERE status = 'sending' AND locked_until < ?", [nowMs]);   // reprise après crash
-    const due = await wall(`SELECT n.*, r.title AS r_title, r.status AS r_status, r.tz AS r_tz FROM programmer_notifications n JOIN programmer_reminders r ON r.id = n.reminder_id
+    const due = await wall(`SELECT n.*, r.title AS r_title, r.status AS r_status, r.tz AS r_tz, r.icon AS r_icon FROM programmer_notifications n JOIN programmer_reminders r ON r.id = n.reminder_id
                             WHERE n.status = 'pending' AND n.next_attempt_at <= ? ORDER BY n.fire_at LIMIT ?`, [nowMs, CFG.BATCH]);
     for (const n of due) {
       const claim = await wrun("UPDATE programmer_notifications SET status = 'sending', locked_until = ?, attempts = attempts + 1 WHERE id = ? AND status = 'pending'", [nowMs + 2 * MIN, n.id]);
@@ -894,7 +914,8 @@ function createProgrammer({ db, logger = console, sender = undefined, now = () =
           title: n.lead_minutes > 0 ? `Dans ${leadText(n.lead_minutes)}` : "Luba Programmer",
           body: n.lead_minutes > 0 ? `${n.r_title} — à ${fmtTime(lt.h, lt.mi)}` : late ? `${n.r_title} (prévu à ${fmtTime(lt.h, lt.mi)})` : n.r_title,
           tag: `luba-reminder-${n.reminder_id}-${n.occurrence_at}-${n.lead_minutes}`, type: "reminder", url: "./#programmer",
-          data: { type: "reminder", reminderId: n.reminder_id, occurrenceAt: n.occurrence_at }
+          illustration: ICONS.includes(n.r_icon) ? n.r_icon : "bell",   // le service worker en tire l'icône + la grande image (notif/<nom>.png, notif/<nom>-banner.png)
+          data: { type: "reminder", reminderId: n.reminder_id, occurrenceAt: n.occurrence_at, illustration: ICONS.includes(n.r_icon) ? n.r_icon : "bell" }
         };
         const ttlSec = Math.max(60, Math.min(86400, Math.floor((CFG.GRACE_MS - (nowMs - n.fire_at)) / 1000)));
         const res = await pushTo(n.user_id, payload, { ttlSec, urgency: "high" });
@@ -1080,6 +1101,84 @@ function createProgrammer({ db, logger = console, sender = undefined, now = () =
     return n;
   }
 
+  // ---------- Outils IA (consulter / créer / modifier / terminer / supprimer) ----------
+  function toolView(p) {
+    const t = parseHm(p.time) || { h: 0, mi: 0 };
+    return {
+      id: p.id, title: p.title, description: p.description || null, icon: p.icon, status: p.status,
+      date: p.nextRunLocal ? p.nextRunLocal.date : p.date, time: p.nextRunLocal ? p.nextRunLocal.time : p.time,
+      when: p.nextRunAt ? fmtWhen(Date.parse(p.nextRunAt), p.timezone, now()) : null, timezone: p.timezone,
+      recurrence: p.recurrence || null, recurrence_text: p.recurrence ? recurrenceText(p.recurrence, t.h, t.mi) : null,
+      notify_before_minutes: (p.leadMinutes || []).filter((x) => x > 0)
+    };
+  }
+  async function toolExec(name, args, ctx) {
+    args = args && typeof args === "object" ? args : {};
+    ctx = ctx || {};
+    const fail = (code, message) => ({ success: false, code, message });
+    const userId = ctx.userId;
+    if (!CFG.ENABLED || !state.started) return fail("PROGRAMMER_UNAVAILABLE", "Luba Programmer n'est pas actif sur le serveur : rien n'a été fait.");
+    if (!userId) return fail("UNAUTHENTICATED", "Utilisateur non identifié : rien n'a été fait.");
+    const guard = TOOL_INTENT[name];
+    if (guard && typeof ctx.userMessage === "string") {
+      const m = ctx.userMessage;
+      if (!guard.test(m) && !(m.length <= 60 && AFFIRM_RE.test(m))) return fail("USER_CONFIRMATION_REQUIRED", "Rien n'a été modifié : le dernier message de l'utilisateur ne demande pas cette action. Demande-lui de la confirmer clairement.");
+    }
+    try {
+      const nowMs = now();
+      const st = await getSettings(userId);
+      const tz = st.timezone;
+      switch (name) {
+        case "reminders_list": {
+          const status = ["active", "done", "all"].includes(args.status) ? args.status : "active";
+          let rows = await listReminders(userId, { status, limit: 200 });
+          const toks = fold(String(args.query || "")).split(/\s+/).filter(Boolean);
+          if (toks.length) rows = rows.filter((r) => { const hay = fold(`${r.title} ${r.description || ""}`); return toks.every((t) => hay.includes(t)); });
+          const lim = Math.min(Math.max(parseInt(args.limit, 10) || 30, 1), 50);
+          const l = localParts(nowMs, tz);
+          return { success: true, timezone: tz, now: { iso: new Date(nowMs).toISOString(), local: `${ymd(l)} ${pad2(l.h)}:${pad2(l.mi)}`, weekday: WDAYS[l.dow] }, count: rows.length, reminders: rows.slice(0, lim).map(toolView), push_enabled: st.pushEnabled };
+        }
+        case "reminder_create": {
+          let date = args.date, time = args.time;
+          if (args.in_minutes !== undefined && args.in_minutes !== null) {
+            const m = Number(args.in_minutes);
+            if (!Number.isInteger(m) || m < 1 || m > 10080) return fail("INVALID_TIME", "in_minutes doit être un entier entre 1 et 10080.");
+            const l = localParts(nowMs + m * MIN, tz); date = ymd(l); time = `${pad2(l.h)}:${pad2(l.mi)}`;
+          }
+          const rec = args.recurrence === "" || args.recurrence === false ? null : args.recurrence;
+          const out = await createReminder(userId, { title: args.title, description: args.description, icon: args.icon, date, time, recurrence: rec, leadMinutes: args.lead_minutes }, { source: "llm", convId: ctx.convId || null, dedupe: true });
+          const ps = await pushStatus(userId);
+          return { success: true, created: !out.duplicate, duplicate: out.duplicate, reminder: toolView(out.reminder), push: { configured: ps.configured, devices: ps.activeSubscriptions } };
+        }
+        case "reminder_update": {
+          const before = toolView(present(await getOwned(userId, args.reminder_id), nowMs));
+          const patch = {};
+          for (const k of ["title", "description", "icon", "date", "time"]) if (args[k] !== undefined) patch[k] = args[k];
+          if (args.recurrence !== undefined) patch.recurrence = args.recurrence === "" || args.recurrence === false ? null : args.recurrence;
+          if (args.lead_minutes !== undefined) patch.leadMinutes = args.lead_minutes;
+          if (!Object.keys(patch).length) return fail("NOTHING_TO_UPDATE", "Aucun champ à modifier n'a été fourni : rien n'a été changé.");
+          const after = await updateReminder(userId, args.reminder_id, patch);
+          return { success: true, before: { title: before.title, when: before.when }, reminder: toolView(after) };
+        }
+        case "reminder_complete": {
+          const r = await completeReminder(userId, args.reminder_id);
+          return { success: true, reminder: toolView(r), next_occurrence: r.status === "scheduled" ? toolView(r).when : null };
+        }
+        case "reminder_delete": {
+          const row = await getOwned(userId, args.reminder_id);
+          const was = toolView(present(row, nowMs));
+          await deleteReminder(userId, row.id);
+          return { success: true, deleted: { id: row.id, title: was.title, when: was.when } };
+        }
+        default: return fail("UNKNOWN_TOOL", "Outil inconnu.");
+      }
+    } catch (e) {
+      if (e && e.status && e.status < 500) return fail(e.code || "REJECTED", `${e.message} Rien n'a été modifié.`);
+      logger.error({ err: e && e.message, tool: name, userId }, "Luba Programmer : outil IA échoué");
+      return fail("INTERNAL", "Erreur interne : l'opération a échoué.");
+    }
+  }
+
   // ---------- Routes HTTP ----------
   function mount(app, { auth, rateLimit, wrap, express = null }) {
     if (!CFG.ENABLED) return;
@@ -1114,7 +1213,7 @@ function createProgrammer({ db, logger = console, sender = undefined, now = () =
     }));
     route("post", "/push/unsubscribe", ...A, wrap(async (req, res) => res.json({ success: true, removed: await removeSubscription(req.userId, body(req).endpoint) })));
     route("post", "/push/test", ...A, wrap(async (req, res) => {
-      const r = await pushTo(req.userId, { title: "Luba Programmer", body: "Notification de test : tout fonctionne.", tag: "luba-test", type: "reminder", url: "./#programmer", data: { type: "reminder-test" } }, { ttlSec: 120, urgency: "normal" });
+      const r = await pushTo(req.userId, { title: "Luba Programmer", body: "Notification de test : tout fonctionne.", tag: "luba-test", type: "reminder", url: "./#programmer", illustration: "bell", data: { type: "reminder-test", illustration: "bell" } }, { ttlSec: 120, urgency: "normal" });
       res.json({ success: r.code === "OK", result: r.code, accepted: r.results.filter((x) => x.ok).length, errors: r.results.filter((x) => !x.ok).map((x) => ({ status: x.status, error: x.error })) });
     }));
 
@@ -1155,11 +1254,11 @@ function createProgrammer({ db, logger = console, sender = undefined, now = () =
     CFG, start, stop, tick, mount, migrate: () => migrate(db), state,
     createReminder, updateReminder, completeReminder, deleteReminder, listReminders, getDetails, agenda, memoryLines,
     getSettings, saveSettings, rememberTimezone, saveSubscription, removeSubscription, pushStatus, pushTo,
-    handleChatMessage, contextBlock, createFromTask, applyTimezoneToReminders, present
+    handleChatMessage, contextBlock, createFromTask, applyTimezoneToReminders, present, toolExec
   };
 }
 
 module.exports = {
-  VERSION, MIGRATION_ID, createProgrammer, parseReminder, resolveDraft, isListRequest, normRule, nextAfter, matchesRule, recurrenceText, validateSubscription,
+  VERSION, MIGRATION_ID, TOOL_SCHEMAS, createProgrammer, parseReminder, resolveDraft, isListRequest, normRule, nextAfter, matchesRule, recurrenceText, validateSubscription,
   zonedToUtc, localParts, isValidTz, fold, inferIcon, fmtWhen, migrate, makeWebPushSender
 };
