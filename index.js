@@ -1787,6 +1787,9 @@ const PROVIDERS = {
   openrouter: { kind: "openai", baseURL: "https://openrouter.ai/api/v1", usage: true, keys: keyPool(["OPENROUTER_API_KEY", "OPENROUTER_API_KEY_2", "OPENROUTER_API_KEY_3"]) },
   cerebras: { kind: "openai", baseURL: "https://api.cerebras.ai/v1", usage: false, keys: keyPool(["CEREBRAS_API_KEY", "CEREBRAS_API_KEY_2"]) },
   gemini: { kind: "gemini", baseURL: "https://generativelanguage.googleapis.com/v1beta", keys: keyPool(["GEMINI_API_KEY", "GEMINI_API_KEY_2"]) },
+  // Remplace OpenRouter (clé qui ne répond plus) : la clé dédiée GEMINI_EARS_API_KEY (ou l'ancien nom GEMINI_TTS_API_KEY) sert aussi de secours LLM.
+  // Fournisseur distinct de « gemini » : cooldown, disjoncteur et quota suivis séparément de ta clé principale.
+  gemini2: { kind: "gemini", baseURL: "https://generativelanguage.googleapis.com/v1beta", keys: keyPool([["GEMINI_EARS_API_KEY", "GEMINI_TTS_API_KEY"].find((n) => (process.env[n] || "").trim())].filter(Boolean)) },
   fake: { kind: "fake", keys: [{ apiKey: "fake", label: "fake" }] }
 };
 
@@ -1806,8 +1809,8 @@ const TIERS = {
       mk("groq", envStr("GROQ_MODEL_V100", "openai/gpt-oss-120b")),
       mk("gemini", envStr("GEMINI_MODEL_V100", "gemini-2.5-flash"), { maxTokens: 8000 }),
       mk("cerebras", envStr("CEREBRAS_MODEL_V100", "qwen-3.8-27b")),
-      mk("openrouter", envStr("OPENROUTER_MODEL_V100_FALLBACK_1", "meta-llama/llama-3.3-70b-instruct:free")),
-      mk("openrouter", envStr("OPENROUTER_MODEL_V100_FALLBACK_2", "qwen/qwen-2.5-72b-instruct:free")),
+      mk("gemini2", envStr("GEMINI2_MODEL_V100_FALLBACK_1", "gemini-2.5-flash"), { maxTokens: 8000 }),            // remplace OpenRouter
+      mk("gemini2", envStr("GEMINI2_MODEL_V100_FALLBACK_2", "gemini-2.5-flash-lite"), { maxTokens: 8000 }),       // remplace OpenRouter
       mk("groq", envStr("GROQ_MODEL_V100_FALLBACK", "llama-3.1-8b-instant")),                     // quota séparé de gpt-oss : filet de sécurité rapide
       mk("gemini", envStr("GEMINI_MODEL_V100_FALLBACK", "gemini-2.5-flash-lite"), { maxTokens: 8000 })
     ]
@@ -1816,14 +1819,14 @@ const TIERS = {
     lane: "heavy",
     chain: [
       mk("groq", envStr("GROQ_MODEL_V250_REASONING", "openai/gpt-oss-120b"), { maxTokens: 8000, temperature: 0.6, reasoningEffort: "high" }),
-      mk("openrouter", envStr("OPENROUTER_MODEL_V250_REASONING", "deepseek/deepseek-r1:free"), { maxTokens: 8000, temperature: 0.6 }),
+      mk("gemini2", envStr("GEMINI2_MODEL_V250_REASONING", "gemini-2.5-pro"), { maxTokens: 8000, temperature: 0.4 }),   // remplace OpenRouter (DeepSeek R1)
       mk("gemini", envStr("GEMINI_MODEL_V250_REASONING", "gemini-2.5-flash"), { maxTokens: 8000, temperature: 0.3 }),
       mk("groq", envStr("GROQ_MODEL_V250_FALLBACK", "llama-3.3-70b-versatile"), { maxTokens: 6000, temperature: 0.6 })
     ],
     code: [
       mk("groq", envStr("GROQ_MODEL_V250_CODE", "openai/gpt-oss-120b"), { maxTokens: envInt("CODE_MAX_TOKENS", 12000), temperature: 0.4 }),
       mk("cerebras", envStr("CEREBRAS_MODEL_V250_CODE", "qwen-3.8-27b"), { maxTokens: envInt("CODE_MAX_TOKENS", 12000), temperature: 0.4 }),
-      mk("openrouter", envStr("OPENROUTER_MODEL_V250_CODE", "qwen/qwen3-coder-480b:free"), { maxTokens: envInt("CODE_MAX_TOKENS", 12000), temperature: 0.4 }),
+      mk("gemini2", envStr("GEMINI2_MODEL_V250_CODE", "gemini-2.5-flash"), { maxTokens: envInt("CODE_MAX_TOKENS", 12000), temperature: 0.4 }),   // remplace OpenRouter (Qwen3 Coder)
       mk("gemini", envStr("GEMINI_MODEL_V250_CODE", "gemini-2.5-flash"), { maxTokens: envInt("CODE_MAX_TOKENS", 12000), temperature: 0.4 })   // secours long-contexte
     ]
   },
@@ -1832,7 +1835,7 @@ const TIERS = {
     chain: [
       mk("groq", envStr("VISION_MODEL_GROQ", "meta-llama/llama-4-maverick-17b-128e-instruct")),
       mk("gemini", envStr("VISION_MODEL_GEMINI", "gemini-2.5-flash")),
-      mk("openrouter", envStr("VISION_MODEL_OPENROUTER", "qwen/qwen-2.5-vl-72b-instruct:free"))
+      mk("gemini2", envStr("GEMINI2_MODEL_VISION", "gemini-2.5-flash"))                                          // remplace OpenRouter (Qwen-VL)
     ]
   }
 };
@@ -8066,6 +8069,7 @@ const LLM_PROVIDERS = Object.freeze({
 
 if (LLM_PROVIDERS.GROQ.keyPool.length > 0) logger.info(`🔑 Groq : ${LLM_PROVIDERS.GROQ.keyPool.length} clé(s)`);
 if (LLM_PROVIDERS.OPENROUTER.keyPool.length > 0) logger.info(`🔑 OpenRouter : ${LLM_PROVIDERS.OPENROUTER.keyPool.length} clé(s)`);
+if (String(process.env.GEMINI_EARS_API_KEY || process.env.GEMINI_TTS_API_KEY || "").trim()) logger.info("👂 Oreille Gemini : clé dédiée détectée (repli automatique sur Groq Whisper)");
 if (LLM_PROVIDERS.CEREBRAS.keyPool.length > 0) logger.info(`🔑 Cerebras : ${LLM_PROVIDERS.CEREBRAS.keyPool.length} clé(s)`);
 if (LLM_PROVIDERS.GEMINI.keyPool.length > 0) logger.info(`🔑 Gemini : ${LLM_PROVIDERS.GEMINI.keyPool.length} clé(s)`);
 
@@ -9534,6 +9538,79 @@ async function transcribeAudioGroq(buffer, filename, mimetype) {
   return { success: false, error: "Échec transcription (Groq + Deepgram)" };
 }
 
+// ---------- « L'oreille » : Gemini (clé dédiée) d'abord, puis Groq Whisper / Deepgram ----------
+// Clé : GEMINI_EARS_API_KEY (ou, si absente, GEMINI_TTS_API_KEY : l'ancien nom reste valable).
+// Les transcriptions PARTIELLES restent sur Groq (elles retranscrivent tout le tampon à chaque morceau : trop de requêtes pour Gemini).
+const earsKey = () => String(process.env.GEMINI_EARS_API_KEY || process.env.GEMINI_TTS_API_KEY || "").trim();
+const earsState = { fails: 0, opens: 0, openUntil: 0, probing: false, ok: 0, ko: 0, lastError: null };
+const earsBadMime = new Map();   // format refusé par Gemini (400) → ignoré 30 min, Groq prend directement
+const earsMime = (m) => {
+  const b = String(m || "audio/webm").split(";")[0].trim().toLowerCase();
+  return ({ "audio/mpeg": "audio/mp3", "audio/x-wav": "audio/wav", "audio/wave": "audio/wav", "audio/x-m4a": "audio/mp4", "audio/m4a": "audio/mp4" })[b] || b;
+};
+function earsFail(kind, msg) {
+  earsState.ko++; earsState.lastError = String(msg || kind).slice(0, 200);
+  const wasProbe = earsState.probing; earsState.probing = false;
+  const base = parseInt(process.env.GEMINI_EARS_COOLDOWN_MS || "30000", 10) || 30000;
+  let cool = 0;
+  if (kind === "rate_limit") cool = 60000;
+  else if (kind === "auth") cool = 10 * 60 * 1000;
+  else { earsState.fails++; if (wasProbe || earsState.fails >= 3) cool = Math.min(10 * 60 * 1000, base * 2 ** Math.min(earsState.opens, 4)); }
+  if (cool) { earsState.opens++; earsState.openUntil = Date.now() + cool; earsState.fails = 0; logger.warn({ kind, cooldownMs: cool, err: earsState.lastError }, "👂 Gemini (oreille) en pause : transcription par Groq"); }
+}
+function earsStatus() {
+  const t = Date.now();
+  return { configured: Boolean(earsKey()), model: process.env.GEMINI_EARS_MODEL || "gemini-2.5-flash", breaker: !earsKey() ? "off" : earsState.openUntil > t ? "open" : earsState.openUntil ? "half-open" : "closed", ok: earsState.ok, failed: earsState.ko, lastError: earsState.lastError };
+}
+
+async function transcribeAudioGemini(buffer, mimetype) {
+  const key = earsKey();
+  if (!key || !buffer || !buffer.length) return { success: false, skipped: true };
+  const mime = earsMime(mimetype), t0 = Date.now();
+  if ((earsBadMime.get(mime) || 0) > t0 || buffer.length > 14 * 1024 * 1024) return { success: false, skipped: true };
+  if (earsState.openUntil > t0) return { success: false, skipped: true };
+  if (earsState.openUntil) { if (earsState.probing) return { success: false, skipped: true }; earsState.probing = true; }
+  const model = process.env.GEMINI_EARS_MODEL || "gemini-2.5-flash";
+  const generationConfig = { temperature: 0 };
+  if (/gemini-2\.5-flash(?!-lite)/.test(model)) generationConfig.thinkingConfig = { thinkingBudget: 0 };   // transcription : pas de « réflexion », plus rapide
+  try {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+      body: JSON.stringify({
+        contents: [{ parts: [
+          { text: "Transcris fidèlement la parole de cet audio, dans la langue parlée (français par défaut). Réponds UNIQUEMENT par la transcription, sans commentaire ni guillemets. S'il n'y a aucune parole intelligible, réponds par un texte vide." },
+          { inlineData: { mimeType: mime, data: buffer.toString("base64") } }
+        ] }],
+        generationConfig
+      }),
+      signal: AbortSignal.timeout(parseInt(process.env.GEMINI_EARS_TIMEOUT_MS || "20000", 10) || 20000)
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      const msg = `HTTP ${res.status} ${body.replace(/\s+/g, " ").slice(0, 160)}`;
+      if (res.status === 400) { earsState.probing = false; earsBadMime.set(mime, Date.now() + 30 * 60 * 1000); logger.warn({ mime, err: msg }, "👂 Gemini refuse ce format audio : Groq prend le relais pour ce format"); }
+      else earsFail(res.status === 429 ? "rate_limit" : [401, 403].includes(res.status) ? "auth" : "server", msg);
+      return { success: false, error: msg };
+    }
+    const data = await res.json();
+    let text = (data?.candidates?.[0]?.content?.parts || []).filter((x) => typeof x.text === "string" && x.thought !== true).map((x) => x.text).join(" ").replace(/\s+/g, " ").trim();
+    if (/^[\[(]?\s*(silence|aucune parole|no speech|pas de parole)[^\n]{0,40}$/i.test(text)) text = "";
+    earsState.ok++; earsState.fails = 0; earsState.openUntil = 0; earsState.probing = false; earsState.opens = 0;
+    return { success: true, text, provider: "gemini", latencyMs: Date.now() - t0 };
+  } catch (e) {
+    earsFail(e.name === "TimeoutError" || e.name === "AbortError" ? "timeout" : "network", e.message);
+    return { success: false, error: e.message };
+  }
+}
+
+/** Transcription finale : Gemini si dispo, sinon Groq Whisper (puis Deepgram). */
+async function transcribeAudio(buffer, filename, mimetype) {
+  const g = await transcribeAudioGemini(buffer, mimetype).catch(() => ({ success: false }));
+  if (g.success) return g;
+  return transcribeAudioGroq(buffer, filename, mimetype);
+}
+
 class StreamingSTT {
   constructor({ onPartial, onFinal, onError } = {}) {
     this.onPartial = onPartial || (() => {});
@@ -9567,7 +9644,7 @@ class StreamingSTT {
     this.closed = true;
     if (!this.buffer.length) return { success: false, error: "Empty buffer" };
     const merged = Buffer.concat(this.buffer);
-    const r = await transcribeAudioGroq(merged, "final.webm", mimetype);
+    const r = await transcribeAudio(merged, "final.webm", mimetype);
     if (r.success) this.onFinal(r.text);
     else this.onError(r.error);
     this.buffer = [];
@@ -9650,8 +9727,6 @@ async function synthesizePiper(text, { voice = "fr_FR-siwis-medium", speed = 1.0
   }
 }
 
-const lubaVoice = require("./luba-voice");
-
 async function synthesizeSpeech(text, options = {}) {
   if (!text || !text.trim()) return { success: false, error: "Texte vide" };
 
@@ -9664,23 +9739,14 @@ async function synthesizeSpeech(text, options = {}) {
     .replace(/\n{2,}/g, ". ")
     .trim();
 
-  // 1) Gemini TTS (clé dédiée GEMINI_TTS_API_KEY) — bascule auto si échecs répétés
-  try {
-    const g = await lubaVoice.synthesizeGemini(clean, {
-      geminiVoice: options.geminiVoice,
-      language: options.language || (/^en/i.test(String(options.voice || "")) || /^[ab][fm]_/.test(String(options.voice || "")) ? "en" : "fr")
-    });
-    if (g.success) return g;
-  } catch {}
-
-  // 2) Moteurs serveur de secours
+  // 1) Moteurs serveur éventuels (ignorés s'ils ne sont pas configurés)
   const k = await synthesizeKokoro(clean, options);
   if (k.success) return k;
 
   const p = await synthesizePiper(clean, { ...options, voice: options.piperVoice || process.env.PIPER_VOICE || "fr_FR-siwis-medium" });
   if (p.success) return p;
 
-  // 3) Aucun moteur serveur : le client doit utiliser la voix système (speechSynthesis)
+  // 2) Aucun moteur serveur : le client lit le texte avec la voix du téléphone (speechSynthesis / TTS système)
   return { success: false, error: "Aucun moteur TTS disponible", fallback: "system" };
 }
 
@@ -10529,7 +10595,7 @@ Object.assign(module.exports, {
   TOOL_SCHEMAS, TOOLS_BY_CONTEXT, SIDE_EFFECT_TOOLS,
   getToolSchemas, validateToolArgs, executeToolNative,
   runToolLoop, dedupeVideos,
-  transcribeAudioGroq, StreamingSTT,
+  transcribeAudioGroq, transcribeAudioGemini, transcribeAudio, earsStatus, StreamingSTT,
   synthesizeKokoro, synthesizePiper, synthesizeSpeech,
   SimpleVAD, SentenceChunker, VoicePipeline,
   buildRollingSummary, SHORT_MEMORY_MAX_EXCHANGES,
@@ -15662,7 +15728,7 @@ app.post("/api/voice/transcribe", apiLimiter, authenticateUser, uploadAudio.sing
     const q = await checkUserQuota(req.userId, "message", req.userRole);
     if (!q.allowed) return res.status(429).json({ success: false, error: true, reply: q.message, code: "QUOTA_EXCEEDED" });
 
-    const r = await transcribeAudioGroq(req.file.buffer, req.file.originalname, req.file.mimetype);
+    const r = await transcribeAudio(req.file.buffer, req.file.originalname, req.file.mimetype);
     if (!r.success) return res.status(502).json({ success: false, error: true, reply: "Transcription indisponible.", code: "TRANSCRIPTION_FAILED" });
     return res.json({ success: true, error: false, text: sanitizeForLLM(r.text, 5000), provider: r.provider });
   } catch {
