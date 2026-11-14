@@ -8069,7 +8069,7 @@ const LLM_PROVIDERS = Object.freeze({
 
 if (LLM_PROVIDERS.GROQ.keyPool.length > 0) logger.info(`🔑 Groq : ${LLM_PROVIDERS.GROQ.keyPool.length} clé(s)`);
 if (LLM_PROVIDERS.OPENROUTER.keyPool.length > 0) logger.info(`🔑 OpenRouter : ${LLM_PROVIDERS.OPENROUTER.keyPool.length} clé(s)`);
-if (String(process.env.GEMINI_EARS_API_KEY || process.env.GEMINI_TTS_API_KEY || "").trim()) logger.info("👂 Oreille Gemini : clé dédiée détectée (repli automatique sur Groq Whisper)");
+if (String(process.env.GEMINI_EARS_API_KEY || process.env.GEMINI_TTS_API_KEY || "").trim()) logger.info("👂 Gemini : clé dédiée détectée (renfort de transcription si Groq échoue)");
 if (LLM_PROVIDERS.CEREBRAS.keyPool.length > 0) logger.info(`🔑 Cerebras : ${LLM_PROVIDERS.CEREBRAS.keyPool.length} clé(s)`);
 if (LLM_PROVIDERS.GEMINI.keyPool.length > 0) logger.info(`🔑 Gemini : ${LLM_PROVIDERS.GEMINI.keyPool.length} clé(s)`);
 
@@ -9538,9 +9538,9 @@ async function transcribeAudioGroq(buffer, filename, mimetype) {
   return { success: false, error: "Échec transcription (Groq + Deepgram)" };
 }
 
-// ---------- « L'oreille » : Gemini (clé dédiée) d'abord, puis Groq Whisper / Deepgram ----------
+// ---------- « L'oreille » de RENFORT : Gemini (clé dédiée) n'est utilisé que si Groq Whisper et Deepgram échouent ----------
 // Clé : GEMINI_EARS_API_KEY (ou, si absente, GEMINI_TTS_API_KEY : l'ancien nom reste valable).
-// Les transcriptions PARTIELLES restent sur Groq (elles retranscrivent tout le tampon à chaque morceau : trop de requêtes pour Gemini).
+// Les transcriptions PARTIELLES (StreamingSTT) restent sur Groq uniquement.
 const earsKey = () => String(process.env.GEMINI_EARS_API_KEY || process.env.GEMINI_TTS_API_KEY || "").trim();
 const earsState = { fails: 0, opens: 0, openUntil: 0, probing: false, ok: 0, ko: 0, lastError: null };
 const earsBadMime = new Map();   // format refusé par Gemini (400) → ignoré 30 min, Groq prend directement
@@ -9556,7 +9556,7 @@ function earsFail(kind, msg) {
   if (kind === "rate_limit") cool = 60000;
   else if (kind === "auth") cool = 10 * 60 * 1000;
   else { earsState.fails++; if (wasProbe || earsState.fails >= 3) cool = Math.min(10 * 60 * 1000, base * 2 ** Math.min(earsState.opens, 4)); }
-  if (cool) { earsState.opens++; earsState.openUntil = Date.now() + cool; earsState.fails = 0; logger.warn({ kind, cooldownMs: cool, err: earsState.lastError }, "👂 Gemini (oreille) en pause : transcription par Groq"); }
+  if (cool) { earsState.opens++; earsState.openUntil = Date.now() + cool; earsState.fails = 0; logger.warn({ kind, cooldownMs: cool, err: earsState.lastError }, "👂 Gemini (renfort transcription) en pause"); }
 }
 function earsStatus() {
   const t = Date.now();
@@ -9604,11 +9604,13 @@ async function transcribeAudioGemini(buffer, mimetype) {
   }
 }
 
-/** Transcription finale : Gemini si dispo, sinon Groq Whisper (puis Deepgram). */
+/** Transcription : comme avant (Groq Whisper, puis Deepgram). Gemini n'intervient qu'en RENFORT, si Groq ET Deepgram ont échoué.
+ *  Une transcription vide (silence) n'est jamais « corrigée » par Gemini : il aurait tendance à inventer du texte. */
 async function transcribeAudio(buffer, filename, mimetype) {
+  const r = await transcribeAudioGroq(buffer, filename, mimetype);
+  if (r.success) return r;
   const g = await transcribeAudioGemini(buffer, mimetype).catch(() => ({ success: false }));
-  if (g.success) return g;
-  return transcribeAudioGroq(buffer, filename, mimetype);
+  return g.success ? g : r;
 }
 
 class StreamingSTT {
