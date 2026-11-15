@@ -467,7 +467,8 @@ const CONFIG = deepFreeze({
     COOLDOWN_MS: envInt("HEALTH_COOLDOWN_MS", 20000),
     MAX_COOLDOWN_MS: envInt("HEALTH_MAX_COOLDOWN_MS", 120000),
     KEY_COOLDOWN_MS: envInt("KEY_COOLDOWN_MS", 15000),
-    KEY_AUTH_COOLDOWN_MS: envInt("KEY_AUTH_COOLDOWN_MS", 600000)
+    KEY_AUTH_COOLDOWN_MS: envInt("KEY_AUTH_COOLDOWN_MS", 600000),
+    MODEL_BAN_MS: envInt("MODEL_BAN_MS", 6 * 3600 * 1000)   // [FIX] modèle retiré (HTTP 404) : écarté 6 h au lieu d'être réessayé à chaque message
   },
 
   RETRY: { MAX_PER_PROVIDER: envInt("RETRY_MAX_PER_PROVIDER", 1), BASE_MS: envInt("RETRY_BASE_MS", 250) },
@@ -1956,7 +1957,8 @@ class ProviderHealth {
   }
   /** Ordre d'essai : sains triés par (priorité + pénalités), puis ouverts en dernier recours. */
   rank(chain) {
-    const scored = chain.map((pc, i) => {
+    const usable = chain.filter((pc) => !this.isBanned(pc));   // [FIX] les modèles retirés (404) ne sont plus jamais essayés
+    const scored = (usable.length ? usable : chain).map((pc, i) => {
       const n = this._n(pc);
       const slow = n.ewmaTtft && n.ewmaTtft > 8000 ? 0.8 : 0;
       return { pc, ok: this.canTry(pc), score: i + this.failRate(n) * 4 + slow, openUntil: n.openUntil };
@@ -2258,6 +2260,9 @@ async function streamFake({ pc, messages, tools, wd, h }) {
 }
 
 ProviderHealth.prototype.release = function release(pc) { this._n(pc).probing = false; };
+/** [FIX] Modèle retiré/inexistant (404) : exclu du classement (même du « dernier recours ») pendant `ms`. */
+ProviderHealth.prototype.ban = function ban(pc, ms) { const n = this._n(pc); n.bannedUntil = now() + ms; n.state = "open"; n.openUntil = n.bannedUntil; n.probing = false; };
+ProviderHealth.prototype.isBanned = function isBanned(pc) { return (this._n(pc).bannedUntil || 0) > now(); };
 
 // ================================================================================
 // §10 — ORCHESTRATEUR LLM (streaming réel · failover · outils parallèles)
@@ -2443,10 +2448,20 @@ async function callLLM({ chain, messages, tools, images, lane, signal, deadlineA
         }
         M.llm.inc({ provider: pc.provider, model: pc.model, outcome: err.kind });
         err.provider = err.provider || pc.provider;
-        lastErr = err;
+        // [FIX] Un 404 « modèle retiré » ne doit plus masquer la vraie cause (429, 413, timeout…) d'un modèle qui, lui, existe.
+        if (err.kind !== "model" || !lastErr || lastErr.kind === "model") lastErr = err;
         noteLlmError(pc, err);
         logger.warn({ provider: pc.provider, model: pc.model, kind: err.kind, status: err.status, attempt, msg: redactSecrets(err.message).slice(0, 200) }, "appel LLM échoué");
         if (visible) committed += visible;     // déjà vu par l'utilisateur → on continuera, sans rejouer
+
+        // ---- [FIX] modèle retiré (404) : instantané → ne consomme pas le budget de tentatives, écarté 6 h, remplacement automatique ----
+        if (err.kind === "model") {
+          attemptsUsed = Math.max(0, attemptsUsed - 1);
+          health.ban(pc, CONFIG.HEALTH.MODEL_BAN_MS);
+          logger.error({ provider: pc.provider, model: pc.model, status: err.status }, "modèle introuvable/retiré (404) → écarté ; changer la variable d'environnement du modèle ou laisser l'auto-réparation le remplacer");
+          queueModelHeal(pc);
+          break;
+        }
 
         // ---- tentatives « souples » : pas de pénalité de santé, même modèle ----
         if (err.kind === "context" && shrinks < 2) {
@@ -2628,6 +2643,84 @@ async function diagnoseProviders({ timeoutMs = 12000 } = {}) {
       return { ...base, ok: false, kind: err.kind, status: err.status, message: redactSecrets(err.message).slice(0, 220), latencyMs: now() - t0 };
     } finally { wd.stop(); }
   }));
+}
+
+// ----- [FIX] Auto-réparation des modèles retirés (HTTP 404) -----
+// Constat des logs : gemini-2.5-flash / flash-lite / pro, llama-3.1-8b-instant, llama-3.3-70b-versatile et llama-4-maverick répondent 404.
+// Avant : chaque message les réessayait puis affichait « (réf : gemini2 404) », en cachant l'erreur réelle de Groq.
+// Maintenant : écartés 6 h, remplacés automatiquement par le modèle le plus récent de la MÊME famille (vérifié par un appel test).
+const MODEL_AUTOHEAL = envBool("MODEL_AUTOHEAL", true);
+const NON_CHAT_RE = /(tts|image|embed|live|audio|whisper|guard|robotics|computer-use|aqa|imagen|veo|orpheus|safeguard|transcri)/i;
+const modelFamily = (id) => { const m = String(id || "").toLowerCase(); return /lite/.test(m) ? "lite" : /flash/.test(m) ? "flash" : /gemini.*pro/.test(m) ? "pro" : /gpt-oss-120b/.test(m) ? "oss120" : /70b|versatile/.test(m) ? "70b" : /(^|[^\d])8b|instant/.test(m) ? "8b" : "other"; };
+const modelVersion = (id) => { const m = /gemini-(\d+(?:\.\d+)?)/.exec(String(id)); return m ? parseFloat(m[1]) : 0; };
+const healedModels = new Map();   // "provider:model" → { to, at }
+
+async function fetchModelCatalog(provider) {
+  const cfg = PROVIDERS[provider], key = keyPools[provider]?.keys?.[0];
+  if (!cfg || !key) return [];
+  try {
+    if (cfg.kind === "gemini") {
+      const ids = []; let token = "";
+      for (let i = 0; i < 5; i++) {
+        const res = await fetch(`${cfg.baseURL}/models?pageSize=200${token ? `&pageToken=${encodeURIComponent(token)}` : ""}`, { headers: { "x-goog-api-key": key.apiKey }, signal: AbortSignal.timeout(8000) });
+        if (!res.ok) break;
+        const j = await res.json();
+        for (const m of j.models || []) if ((m.supportedGenerationMethods || []).includes("generateContent")) ids.push(String(m.name).replace(/^models\//, ""));
+        token = j.nextPageToken || ""; if (!token) break;
+      }
+      return ids;
+    }
+    const res = await fetch(`${cfg.baseURL}/models`, { headers: { Authorization: `Bearer ${key.apiKey}` }, signal: AbortSignal.timeout(8000) });
+    if (!res.ok) return [];
+    return ((await res.json()).data || []).map((m) => m.id).filter(Boolean);
+  } catch { return []; }
+}
+
+async function probeModel(pc) {
+  const cfg = PROVIDERS[pc.provider], key = keyPools[pc.provider]?.keys?.[0];
+  if (!cfg || !key) return false;
+  const wd = makeWatchdog({ firstMs: 12000, idleMs: 12000, totalMs: 12000, parent: null });
+  const h = { onText: () => wd.beat(), onReasoning: () => wd.beat() };
+  try {
+    const streamer = cfg.kind === "gemini" ? streamGemini : streamOpenAI;
+    await streamer({ pc: { ...pc, maxTokens: 24, temperature: 0 }, cfg, key, messages: [{ role: "user", content: "Réponds uniquement : OK" }], tools: null, images: null, wd, h });
+    return true;
+  } catch { return false; } finally { wd.stop(); }
+}
+
+/** dead = [{provider, model}] confirmés en 404. Écarte, puis remplace si un modèle de la même famille répond. Retourne un rapport. */
+async function healDeadModels(dead) {
+  if (!MODEL_AUTOHEAL || CONFIG.FAKE_LLM) return [];
+  const allPcs = [...TIERS.v100.chain, ...TIERS.v250.chain, ...TIERS.v250.code, ...TIERS.vision.chain];
+  const report = [], catalogs = new Map();
+  for (const d of dead) {
+    const k = `${d.provider}:${d.model}`;
+    if (healedModels.has(k)) continue;                               // déjà traité (évite les rafales)
+    healedModels.set(k, { to: null, at: now() });
+    for (const pc of allPcs) if (pc.provider === d.provider && pc.model === d.model) health.ban(pc, CONFIG.HEALTH.MODEL_BAN_MS);
+    const fam = modelFamily(d.model);
+    let chosen = null;
+    if (fam !== "other") {
+      if (!catalogs.has(d.provider)) catalogs.set(d.provider, await fetchModelCatalog(d.provider));
+      const cands = catalogs.get(d.provider)
+        .filter((id) => !NON_CHAT_RE.test(id) && modelFamily(id) === fam && !healedModels.has(`${d.provider}:${id}`))
+        .sort((a, b) => (modelVersion(b) - modelVersion(a)) || (Number(/preview|exp/.test(a)) - Number(/preview|exp/.test(b))) || a.length - b.length)
+        .slice(0, 3);
+      for (const id of cands) {
+        if (await probeModel({ provider: d.provider, model: id })) { chosen = id; break; }
+        healedModels.set(`${d.provider}:${id}`, { to: null, at: now() });
+      }
+    }
+    if (chosen) for (const pc of allPcs) if (pc.provider === d.provider && pc.model === d.model) pc.model = chosen;
+    healedModels.set(k, { to: chosen, at: now() });
+    report.push({ provider: d.provider, retired: d.model, replacedBy: chosen });
+  }
+  return report;
+}
+function queueModelHeal(pc) {
+  healDeadModels([{ provider: pc.provider, model: pc.model }])
+    .then((rep) => { if (rep.length) logger.warn({ report: rep }, "auto-réparation des modèles"); })
+    .catch((e) => logger.warn({ err: e.message }, "auto-réparation des modèles impossible"));
 }
 
 // ================================================================================
@@ -6007,7 +6100,11 @@ async function bootstrap({ listen = true } = {}) {
 
   timers.push(startLoadMonitor());
   if (!CONFIG.FAKE_LLM && envBool("STARTUP_LLM_CHECK", CONFIG.ENV !== "test")) {     // verdict immédiat dans les logs : quel modèle répond, lequel échoue et pourquoi
-    setTimeout(() => diagnoseProviders().then((r) => {
+    setTimeout(() => diagnoseProviders().then(async (r) => {
+      try {   // [FIX] les modèles en 404 détectés au démarrage sont écartés et remplacés AVANT le premier message utilisateur
+        const dead = r.filter((x) => !x.ok && x.kind === "model").map((x) => ({ provider: x.provider, model: x.model }));
+        if (dead.length) logger.warn({ report: await healDeadModels(dead) }, "auto-réparation des modèles (démarrage)");
+      } catch (e) { logger.warn({ err: e.message }, "auto-réparation au démarrage impossible"); }
       // [FIX audit] Ne jamais détacher une méthode du logger (choisir logger.info ou logger.error dans un ternaire puis l'appeler) :
       // pino lit `this` (Symbol(pino.msgPrefix)) ; la méthode détachée levait « Cannot read properties of undefined » et le résultat du diagnostic était perdu.
       for (const x of r) { if (x.ok) logger.info(x, "auto-diagnostic LLM : OK"); else logger.error(x, "auto-diagnostic LLM : ÉCHEC"); }
