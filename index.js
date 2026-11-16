@@ -423,7 +423,7 @@ const CONFIG = deepFreeze({
   // sans qu'on le considère en panne tant que le flux reste vivant.
   TIMEOUTS: {
     LIGHT: {
-      FIRST_TOKEN_MS: envInt("LIGHT_FIRST_TOKEN_MS", 90000),
+      FIRST_TOKEN_MS: envInt("LIGHT_FIRST_TOKEN_MS", 30000),
       IDLE_MS: envInt("LIGHT_IDLE_MS", 90000),
       TOTAL_MS: envInt("LIGHT_TOTAL_MS", 240000)
     },
@@ -448,6 +448,8 @@ const CONFIG = deepFreeze({
   // Le compteur n'est JAMAIS remis à zéro quand on change de modèle, de clé ou de fournisseur. Un tour d'agent = une nouvelle génération.
   LLM_BUDGET: {
     MAX_ATTEMPTS: envInt("LLM_MAX_ATTEMPTS", 5, 1, 20),            // tentatives maximales par génération
+    WAIT_ROUNDS: envInt("LLM_WAIT_ROUNDS", 4, 0, 8),                 // [PERF] relances « on patiente » après une panne passagère (avant : 8)
+    WAIT_MAX_MS: envInt("LLM_WAIT_MAX_MS", 15000, 1000, 30000),      // [PERF] pause maximale entre deux relances (avant : 30 s)
     MAX_TOTAL_MS: envInt("LLM_MAX_TOTAL_MS", 300000, 2000, 900000) // durée totale maximale d'une opération (5 min) : plafonne AUSSI les deadlines des appelants
   },
   AGENT: {
@@ -511,7 +513,7 @@ const CONFIG = deepFreeze({
 
   MEMORY_EXTRACT: envBool("MEMORY_EXTRACT", true),
   LIVE: { MAX_TOKENS: envInt("LIVE_MAX_TOKENS", 380) },
-  DUAL: { ENABLED: envBool("DUAL_MODEL", true), PLAN_TIMEOUT_MS: envInt("DUAL_PLAN_TIMEOUT_MS", 90000), PLAN_MAX_TOKENS: envInt("DUAL_PLAN_MAX_TOKENS", 1500) },
+  DUAL: { ENABLED: envBool("DUAL_MODEL", true), PLAN_TIMEOUT_MS: envInt("DUAL_PLAN_TIMEOUT_MS", 40000), PLAN_MAX_TOKENS: envInt("DUAL_PLAN_MAX_TOKENS", 1500) },
   IMAGES_ONLY: { COUNT: envInt("IMAGES_ONLY_COUNT", 16) },
   RESCUE: { TIMEOUT_MS: envInt("RESCUE_TIMEOUT_MS", 90000), MAX_ATTEMPTS: envInt("RESCUE_MAX_ATTEMPTS", 2, 1, 5) },   // opération de secours dégradée, budget propre et réduit
   DEBUG_TOKEN: envStr("DEBUG_TOKEN", null),
@@ -2521,7 +2523,10 @@ async function orchestrate({ chain, lane, messages, images, tools, executeTool, 
   const usage = { prompt: 0, completion: 0 };
   let provider = null, model = null, ttftMs = null, reasoning = "", partial = false, error = null;
   const maxIt = maxIterations || CONFIG.AGENT.MAX_ITERATIONS;
-  const ctxBudget = () => Math.max(3000, CONFIG.LIMITS.CONTEXT_TOKEN_BUDGET - toolTokens(tools));   // les schémas d'outils comptent dans le prompt
+  // [PERF] Le budget de 9000 jetons couvre l'HISTORIQUE ; le prompt système (≈ 8 000 jetons, toujours conservé) s'y ajoute au lieu de
+  // l'écraser : avant, fitContext n'avait plus de place et supprimait toute la conversation (le modèle « oubliait » le fil).
+  const sysTokens = () => working.filter((m) => m.role === "system").reduce((a, m) => a + estimateTokens(typeof m.content === "string" ? m.content : safeJsonStringify(m.content)) + 6, 0);
+  const ctxBudget = () => sysTokens() + Math.max(3000, CONFIG.LIMITS.CONTEXT_TOKEN_BUDGET - toolTokens(tools));   // les schémas d'outils comptent dans le prompt
 
   const addUsage = (u) => {
     if (!u) return;
@@ -4783,6 +4788,10 @@ const chat = {
         const big = chain.filter((pc) => pc.provider !== "groq");
         if (big.length) chain = big;
       }
+      if (envBool("ADAPTIVE_EFFORT", true) && !live && !hasImages && !bigJob && ["SMALLTALK", "GENERAL"].includes(intent) && run.message.length < 600) {
+        const eff = intent === "SMALLTALK" ? "low" : "medium";   // [PERF] « high » pour « Antarctique » = réflexion longue inutile
+        chain = chain.map((pc) => (pc.reasoningEffort ? { ...pc, reasoningEffort: eff } : pc));
+      }
       const ctx = { userId: run.userId, role: run.role, googleAccessToken: run.googleAccessToken, convId: run.convId, webRun: new WebRun(), userMessage: String(run.message || "") };   // [audit] rôle transmis aux outils (permissions Luba Engine) · [LUBA PROGRAMMER] userMessage : garde-fou des actions destructrices
 
       // NGANDU v250 — double modèle : un architecte (raisonnement) prépare un plan, le constructeur (code) l'exécute.
@@ -4814,8 +4823,8 @@ const chat = {
           if (signal.aborted || !(e instanceof ProviderError)) throw e;
           const left = deadlineAt - now();
           const transient = !["auth", "model", "context", "client"].includes(e.kind);
-          if (transient && round < 8 && left > 25000) {
-            const waitMs = Math.min(30000, 2500 * 2 ** round, left - 20000);
+          if (transient && round < CONFIG.LLM_BUDGET.WAIT_ROUNDS && left > 25000) {
+            const waitMs = Math.min(CONFIG.LLM_BUDGET.WAIT_MAX_MS, 2500 * 2 ** round, left - 20000);
             logger.warn({ runId: run.id, kind: e.kind, provider: e.provider, round: round + 1, waitMs }, "tous les modèles ont échoué (passager) → on patiente puis on relance");
             emit.status("waiting", { round: round + 1, reason: e.kind });
             await sleep(waitMs, signal);
@@ -4844,6 +4853,9 @@ const chat = {
       const sug = fin.sug;
       if (!finalText) throw new ProviderError("empty", "réponse vide");
 
+      const adPromise = (legacy?.getAd && run.channel !== "whatsapp" && !live && !out.imageOnly)
+        ? settle(Promise.resolve().then(() => legacy.getAd({ slot: "chat_below", userId: run.userId })), 1500, null)   // [PERF] lancée avant l'attente de l'image
+        : null;
       let guaranteed = null;
       if (imagePromise) {
         guaranteed = await settle(imagePromise, Math.max(500, Math.min(3000, deadlineAt - now())), null);
@@ -4853,7 +4865,7 @@ const chat = {
 
       // Publicité (facultative, 1,5 s max) — même comportement qu'en v16.5
       let ad = null;
-      if (legacy?.getAd && run.channel !== "whatsapp" && !live && !out.imageOnly) ad = await settle(legacy.getAd({ slot: "chat_below", userId: run.userId }), 1500, null);
+      if (adPromise) ad = await adPromise;
       const srcList = mergeSources(ctx.webRun.sources(), sourceList([...sources]));   // pages consultées d'abord (nom + domaine + icône)
       let footer = "";
       if (ad?.imageUrl) {
