@@ -1,6 +1,6 @@
 "use strict";
 // ================================================================================
-// LUBA PROGRAMMER v1.1.0 — rappels, agenda et notifications Push pour LUBA AI
+// LUBA PROGRAMMER v1.2.0 — rappels, agenda et notifications Push pour LUBA AI
 // HIKLON TECHNOLOGIES · module branché sur le serveur Express / la base SQLite EXISTANTS (aucun 2e serveur, aucune 2e base).
 //
 //   §1 Utilitaires & fuseaux horaires      §5 Analyse du français (Chat / Live)
@@ -15,7 +15,7 @@
 const crypto = require("crypto");
 const net = require("net");
 
-const VERSION = "1.1.0";
+const VERSION = "1.2.0";
 const MIGRATION_ID = "005_programmer_v1";
 const DAY = 86400000;
 const MIN = 60000;
@@ -735,6 +735,41 @@ function createProgrammer({ db, logger = console, sender = undefined, now = () =
     const t = now();
     return rows.map((r) => present(r, t));
   }
+  /** Vue « Luba Programmer » : file d'attente (ce qui va partir) + récents (ce qui est parti). Lecture seule, calculée depuis la base : rien n'est simulé.
+   *  File d'attente = notifications déjà prises en charge par le scheduler (en cours d'envoi / nouvel essai / due) + envois planifiés dans les QUEUE_HOURS prochaines heures.
+   *  Récents = notifications terminées (envoyée, échec, manquée, non remise) des 7 derniers jours, la plus récente d'abord. */
+  async function overview(userId, { limit = 30 } = {}) {
+    const nowMs = now();
+    const lim = Math.min(Math.max(parseInt(limit, 10) || 30, 1), 100);
+    const horizon = envInt("PROGRAMMER_QUEUE_HOURS", 24) * 3600000;
+    const queue = [];
+    const live = await wall(`SELECT n.id, n.reminder_id, n.occurrence_at, n.lead_minutes, n.fire_at, n.status, n.attempts, n.next_attempt_at, n.last_error, r.title, r.icon, r.tz
+                             FROM programmer_notifications n JOIN programmer_reminders r ON r.id = n.reminder_id
+                             WHERE n.user_id = ? AND n.status IN ('pending','sending') AND r.status IN ('scheduled','overdue') ORDER BY n.fire_at LIMIT 200`, [userId]);
+    for (const n of live) {
+      const state = n.status === "sending" ? "sending" : n.attempts > 0 ? "retry" : "due";
+      queue.push({ id: n.id, reminderId: n.reminder_id, title: n.title, icon: n.icon, timezone: n.tz, state, leadMinutes: n.lead_minutes, attempts: n.attempts, error: n.last_error || null,
+        occurrenceAt: new Date(n.occurrence_at).toISOString(), fireAt: new Date(n.fire_at).toISOString(), nextAttemptAt: new Date(n.next_attempt_at).toISOString(), _t: state === "retry" ? n.next_attempt_at : n.fire_at });
+    }
+    const rows = await wall("SELECT id, title, icon, tz, next_run_at, notify_lead FROM programmer_reminders WHERE user_id = ? AND status = 'scheduled' AND next_run_at IS NOT NULL AND next_run_at <= ? ORDER BY next_run_at LIMIT 300", [userId, nowMs + horizon + 7 * DAY]);
+    for (const r of rows) {
+      for (const L of parseJson(r.notify_lead, [0])) {
+        const fireAt = r.next_run_at - L * MIN;
+        if (fireAt <= nowMs || fireAt > nowMs + horizon) continue;     // déjà dû : géré par le scheduler (ligne « live ») ; trop loin : pas encore en file
+        queue.push({ id: `plan:${r.id}:${r.next_run_at}:${L}`, reminderId: r.id, title: r.title, icon: r.icon, timezone: r.tz, state: "planned", leadMinutes: L, attempts: 0, error: null,
+          occurrenceAt: new Date(r.next_run_at).toISOString(), fireAt: new Date(fireAt).toISOString(), nextAttemptAt: null, _t: fireAt });
+      }
+    }
+    const rank = { sending: 0, retry: 1, due: 2, planned: 3 };
+    queue.sort((a, b) => rank[a.state] - rank[b.state] || a._t - b._t);
+    const queueOut = queue.slice(0, lim).map(({ _t, ...q }) => q);
+    const rec = await wall(`SELECT n.id, n.reminder_id, n.occurrence_at, n.lead_minutes, n.fire_at, n.sent_at, n.status, n.attempts, n.last_error, n.accepted_count, r.title, r.icon, r.tz
+                            FROM programmer_notifications n JOIN programmer_reminders r ON r.id = n.reminder_id
+                            WHERE n.user_id = ? AND n.status IN ('sent','failed','missed','undelivered') AND n.fire_at >= ? ORDER BY COALESCE(n.sent_at, n.fire_at) DESC LIMIT ?`, [userId, nowMs - 7 * DAY, lim]);
+    const recent = rec.map((n) => ({ id: n.id, reminderId: n.reminder_id, title: n.title, icon: n.icon, timezone: n.tz, status: n.status, leadMinutes: n.lead_minutes, attempts: n.attempts, error: n.last_error || null, accepted: n.accepted_count,
+      occurrenceAt: new Date(n.occurrence_at).toISOString(), fireAt: new Date(n.fire_at).toISOString(), sentAt: n.sent_at ? new Date(n.sent_at).toISOString() : null }));
+    return { queue: queueOut, recent, counts: { queue: queue.length, recent: recent.length } };
+  }
   async function getDetails(userId, id) {
     const row = await getOwned(userId, id);
     const hist = await wall("SELECT occurrence_at, lead_minutes, fire_at, status, attempts, last_error, accepted_count, sent_at FROM programmer_notifications WHERE reminder_id = ? ORDER BY fire_at DESC LIMIT 50", [row.id]);
@@ -1227,6 +1262,10 @@ function createProgrammer({ db, logger = console, sender = undefined, now = () =
       const out = await createReminder(req.userId, { title: b.title, description: b.description, icon: b.icon, timezone: b.timezone, date: b.date, time: b.time, recurrence: b.recurrence, leadMinutes: b.notify?.leadMinutes ?? b.leadMinutes }, { source: "ui" });
       res.status(201).json({ success: true, reminder: out.reminder });
     }));
+    route("get", "/overview", ...A, wrap(async (req, res) => {
+      tzHeader(req);
+      res.json({ success: true, serverTime: new Date().toISOString(), ...(await overview(req.userId, { limit: req.query?.limit })) });
+    }));
     route("get", "/agenda", ...A, wrap(async (req, res) => {
       const from = Date.parse(req.query?.from), to = Date.parse(req.query?.to);
       if (!Number.isFinite(from) || !Number.isFinite(to)) throw E.badRequest("INVALID_RANGE", "from et to (ISO 8601) sont obligatoires.");
@@ -1252,7 +1291,7 @@ function createProgrammer({ db, logger = console, sender = undefined, now = () =
 
   return {
     CFG, start, stop, tick, mount, migrate: () => migrate(db), state,
-    createReminder, updateReminder, completeReminder, deleteReminder, listReminders, getDetails, agenda, memoryLines,
+    createReminder, updateReminder, completeReminder, deleteReminder, listReminders, overview, getDetails, agenda, memoryLines,
     getSettings, saveSettings, rememberTimezone, saveSubscription, removeSubscription, pushStatus, pushTo,
     handleChatMessage, contextBlock, createFromTask, applyTimezoneToReminders, present, toolExec
   };
