@@ -4623,7 +4623,9 @@ function imageQueryFrom(msg) {
 async function imageOnlyAnswer({ q, ctx, emit, signal }) {
   emit.status("tool", { name: "search_images" });
   const o = await withTimeout(executeTool({ toolName: "search_images", args: { query: q, limit: CONFIG.IMAGES_ONLY.COUNT } }, ctx), 25000, signal, "recherche d'images");
-  const imgs = (o?.result?.images || []).filter((i) => i && typeof i.url === "string" && /^https?:\/\//i.test(i.url));
+  const imgs = (o?.result?.images || []).filter((i) =>
+    i && typeof isSafeImageMetadata === "function" && isSafeImageMetadata(i)
+  );
   if (!imgs.length) return null;
   emit.images(imgs);
   emit.token(IMAGE_ONLY_TEXT);
@@ -6960,22 +6962,33 @@ async function allSettledWithDeadline(promises, deadlineMs) {
 // §1.12 — HELPERS IMAGES
 // ================================================================================
 
+// Filtrage conservateur des métadonnées : le filtrage par mots-clés ne remplace
+// pas une modération visuelle du fichier image lui-même.
+const IMAGE_BLOCKED_CONTENT_RE = /(?:\b(?:nsfw|xxx|porn(?:ographic)?|hentai|erotic|nude|nudity|naked|topless|bottomless|sex(?:ual)?|explicit|adult content|lingerie|bikini|onlyfans|fetish|genital|breast|boobs|nipples?)\b|\b(?:nu|nue|nus|nues|nudite|nudite|pornographie|porno|erotique|erotisme|seins nus|parties intimes|organes genitaux)\b)/i;
+const IMAGE_STOP_WORDS = new Set(["the","and","for","with","from","les","des","une","un","de","du","la","le","qui","quoi","comment","pourquoi","alors","donc","est","etre","sur","dans","avec"]);
+
+function isSafeImageMetadata(image) {
+  if (!image || typeof image.url !== "string" || !/^https:\/\//i.test(image.url)) return false;
+  const metadata = [image.title, image.description, image.pageUrl, image.url, image.source]
+    .filter(Boolean).join(" ").normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  return !IMAGE_BLOCKED_CONTENT_RE.test(metadata);
+}
+
 function imageRelevanceScore(image, query) {
-  if (!image || !query) return 0.5;
+  if (!image || !query) return 0;
   const norm = (s) => String(s || "").toLowerCase()
-    .normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-  const q = norm(query);
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, " ").replace(/\s+/g, " ").trim();
+  const words = norm(query).split(" ").filter((w) => w.length > 2 && !IMAGE_STOP_WORDS.has(w));
+  if (!words.length) return 0;
   const title = norm(image.title);
   const desc = norm(image.description);
-  const combined = `${title} ${desc}`;
-
-  const stop = new Set(["the","and","for","with","from","les","des","une","un","de","du","la","le"]);
-  const words = q.split(/\s+/).filter((w) => w.length > 2 && !stop.has(w));
-  if (words.length === 0) return 0.5;
-
-  let matched = 0;
-  for (const w of words) if (combined.includes(w)) matched++;
-  return matched / words.length;
+  const page = norm(image.pageUrl);
+  const titleMatches = words.filter((w) => (` ${title} `).includes(` ${w} `)).length;
+  const descMatches = words.filter((w) => (` ${desc} `).includes(` ${w} `)).length;
+  const pageMatches = words.filter((w) => (` ${page} `).includes(` ${w} `)).length;
+  // Le titre est prioritaire : une simple mention dans la description ne suffit pas.
+  return Math.min(1, (titleMatches * 1.0 + descMatches * 0.25 + pageMatches * 0.15) / words.length);
 }
 
 function isGreetingOrSmallTalk(message) {
@@ -10940,7 +10953,7 @@ async function searchDuckDuckGo(query, { maxResults = 5 } = {}) {
     if (typeof fn !== "function") return { results: [], provider: "ddg" };
 
     const results = await fn(query, {
-      safeSearch: "moderate",
+      safeSearch: "strict",
       locale: "fr-fr",
       maxResults
     });
@@ -11242,7 +11255,7 @@ async function searchDuckDuckGoImages(query, limit = CONFIG.IMAGES.DDG_LIMIT) {
     const fn = ddgScrape.searchImages || ddgScrape.images;
     if (typeof fn !== "function") return [];
 
-    const results = await fn(query, { safeSearch: "moderate" });
+    const results = await fn(query, { safeSearch: "strict" });
     const list = Array.isArray(results?.results) ? results.results
       : Array.isArray(results) ? results : [];
 
@@ -11316,20 +11329,16 @@ async function searchImagesWithFallbackCore(query, limit = CONFIG.LIMITS.IMAGE_S
     ...ddgImages.map((i) => ({ ...i, _prio: 3 }))
   ];
 
-  const scored = all.map((img) => ({
+  const safe = all.filter(isSafeImageMetadata);
+  const scored = safe.map((img) => ({
     ...img,
     _relevance: imageRelevanceScore(img, cleanQuery)
   }));
 
-  let relevant = scored.filter((img) => img._relevance >= CONFIG.IMAGES.MIN_RELEVANCE);
-  let usedRawFallback = false;
-
-  // 🆕 Si rien de pertinent, on prend les images disponibles quand même
-  if (relevant.length === 0 && all.length > 0) {
-    logger.info({ query: cleanQuery, total: all.length }, "[Luba Images] Fallback sur images brutes");
-    relevant = scored;
-    usedRawFallback = true;
-  }
+  // Pas de fallback brut : mieux vaut n'afficher aucune image que du hors-sujet.
+  const MIN_CONTEXTUAL_IMAGE_RELEVANCE = Math.max(0.34, Number(CONFIG.IMAGES.MIN_RELEVANCE) || 0);
+  let relevant = scored.filter((img) => img._relevance >= MIN_CONTEXTUAL_IMAGE_RELEVANCE);
+  const usedRawFallback = false;
 
   relevant.sort((a, b) => {
     if (Math.abs(a._relevance - b._relevance) > 0.2) return b._relevance - a._relevance;
@@ -11492,18 +11501,20 @@ async function searchImagesWithFallback(query, limit = CONFIG.LIMITS.IMAGE_SEARC
     ? null
     : await refineImageQueryWithLLM(opts.context || baseQuery, baseQuery);
 
-  if (!plan) return searchImagesWithFallbackCore(baseQuery, limit);
+  if (!plan) {
+    const direct = await searchImagesWithFallbackCore(baseQuery, limit);
+    return direct.rawFallback ? { images: [] } : direct;
+  }
 
   let best = null;
   for (const q of plan.queries) {
     const r = await searchImagesWithFallbackCore(q, limit, { refined: true });
-    if (r.images?.length && !r.rawFallback) return r;      // résultat pertinent
-    if (r.images?.length && !best) best = r;               // garde le meilleur "brut"
+    if (r.images?.length && !r.rawFallback) return r;
   }
 
   const original = await searchImagesWithFallbackCore(baseQuery, limit);
   if (original.images?.length && !original.rawFallback) return original;
-  return best || original;
+  return { images: [] };
 }
 
 // ================================================================================
@@ -11521,58 +11532,33 @@ async function searchImagesWithFallback(query, limit = CONFIG.LIMITS.IMAGE_SEARC
  * @returns {Promise<{ images: Array, skipped: boolean, reason: string }>}
  */
 async function ensureImageForResponse(userMessage, entity = null) {
-  // Skip : salutation
-  if (isGreetingOrSmallTalk(userMessage)) {
-    logger.debug({ message: userMessage.slice(0, 50) }, "[Luba Images] Skip (salutation)");
-    return { images: [], skipped: true, reason: "greeting" };
+  const message = String(userMessage || "").trim();
+  if (!message || isGreetingOrSmallTalk(message) || isIdentityOrSelfQuestion(message)) {
+    return { images: [], skipped: true, reason: "smalltalk_or_identity" };
   }
 
-  // Skip : question identité
-  if (isIdentityOrSelfQuestion(userMessage)) {
-    logger.debug({ message: userMessage.slice(0, 50) }, "[Luba Images] Skip (identité)");
-    return { images: [], skipped: true, reason: "identity" };
+  // Pas de galerie automatique pour les échanges sociaux, les calculs ou le code.
+  const intent = typeof preRouteIntent === "function" ? preRouteIntent(message).intent : "GENERAL";
+  if (["MATHS", "CODE", "TASK", "FINANCE", "METEO"].includes(intent)) {
+    return { images: [], skipped: true, reason: `non_visual_intent:${intent.toLowerCase()}` };
   }
 
-  // Construit la query d'image
-  const query = entity || extractEntity(userMessage) || userMessage.split(/\s+/).slice(0, 5).join(" ");
-
+  const query = String(entity || "").trim() || extractEntity(message);
   if (!query || query.length < 2) {
-    return { images: [], skipped: true, reason: "query_too_short" };
+    return { images: [], skipped: true, reason: "no_clear_visual_subject" };
   }
 
-  logger.info({ query }, "[Luba Images] Recherche garantie déclenchée");
-
+  logger.info({ query, intent }, "[Luba Images] Recherche contextuelle déclenchée");
   try {
-    const result = await searchImagesWithFallback(query, 3, { context: userMessage });
-    if (result.images?.length > 0) {
-      return { images: result.images, skipped: false, reason: "found" };
+    const result = await searchImagesWithFallback(query, 3, { context: message });
+    const images = (result.images || []).filter(isSafeImageMetadata);
+    if (!images.length) {
+      return { images: [], skipped: true, reason: "no_safe_relevant_image" };
     }
-
-    // Fallback : essayer avec la query brute (sans extraction)
-    const fallbackQuery = String(userMessage).trim().slice(0, 50);
-    if (fallbackQuery !== query) {
-      const fallbackResult = await searchImagesWithFallback(fallbackQuery, 3, { refine: false });
-      if (fallbackResult.images?.length > 0) {
-        return { images: fallbackResult.images, skipped: false, reason: "found_fallback" };
-      }
-    }
-
-    // Aucune image trouvée → fallback neutre
-    logger.info({ query }, "[Luba Images] Aucune image → fallback neutre");
-    return {
-      images: [{
-        url: "https://placehold.co/600x400/1a73e8/ffffff/png?text=Luba&font=roboto",
-        title: "Luba",
-        description: null,
-        pageUrl: "https://luba.web.app",
-        source: "fallback_neutral"
-      }],
-      skipped: false,
-      reason: "fallback_neutral"
-    };
+    return { images, skipped: false, reason: "relevant_images_found" };
   } catch (e) {
-    logger.warn({ err: e.message, query }, "[Luba Images] Erreur recherche garantie");
-    return { images: [], skipped: true, reason: "error" };
+    logger.warn({ err: e.message, query }, "[Luba Images] Recherche contextuelle échouée");
+    return { images: [], skipped: true, reason: "search_error" };
   }
 }
 
