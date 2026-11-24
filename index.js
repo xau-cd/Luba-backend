@@ -11230,7 +11230,8 @@ async function searchPexelsImages(query, limit = 6) {
 
     const images = (resp.data?.photos || []).map((p) => ({
       url: p.src?.medium || p.src?.large || p.src?.original,
-      title: p.alt || query,
+      // Ne jamais inventer un titre à partir de la requête : cela fausse le score de pertinence.
+      title: p.alt || "",
       description: p.photographer ? `Photo par ${p.photographer}` : null,
       pageUrl: p.url,
       source: "pexels",
@@ -11264,7 +11265,8 @@ async function searchDuckDuckGoImages(query, limit = CONFIG.IMAGES.DDG_LIMIT) {
       .slice(0, limit)
       .map((r) => ({
         url: r.image,
-        title: r.title || query,
+        // Un résultat sans titre reste sans titre : ne pas lui attribuer artificiellement la requête.
+        title: r.title || "",
         description: r.description || null,
         pageUrl: r.url || null,
         source: "duckduckgo"
@@ -11543,14 +11545,16 @@ async function ensureImageForResponse(userMessage, entity = null) {
     return { images: [], skipped: true, reason: `non_visual_intent:${intent.toLowerCase()}` };
   }
 
-  const query = String(entity || "").trim() || extractEntity(message);
+  const query = extractEntity(message);
   if (!query || query.length < 2) {
     return { images: [], skipped: true, reason: "no_clear_visual_subject" };
   }
 
-  logger.info({ query, intent }, "[Luba Images] Recherche contextuelle déclenchée");
+  // La reformulation reçoit toujours le message entier pour désambiguïser les lieux,
+  // acronymes et noms propres. L'entité amont n'est qu'un indice, jamais la requête finale.
+  logger.info({ query, upstreamEntity: String(entity || "").slice(0, 80), intent }, "[Luba Images] Recherche contextuelle déclenchée");
   try {
-    const result = await searchImagesWithFallback(query, 3, { context: message });
+    const result = await searchImagesWithFallback(message, 3, { context: message });
     const images = (result.images || []).filter(isSafeImageMetadata);
     if (!images.length) {
       return { images: [], skipped: true, reason: "no_safe_relevant_image" };
@@ -12424,19 +12428,25 @@ function detectMathExpressions(message) {
 
 function extractEntity(message) {
   if (!message || typeof message !== "string") return "";
-  let m = message.trim().replace(/[?!.,;:]+$/g, "");
+  let m = message.trim().replace(/[?!.,;:]+$/g, " ").replace(/\s+/g, " ");
 
+  // Retirer les formulations conversationnelles AVANT toute détection de nom propre.
+  // Important : ne jamais interpréter « Alors » ou « Ah » comme une entité.
+  m = m.replace(/^(?:(?:alors|donc|bon|eh bien|ah|euh)\s+)+/i, "");
   m = m.replace(
-    /^(qui est|c'?est qui|qui était|montre-moi|montre moi|cherche|trouve-moi|trouve moi|parle-moi de|parle moi de|donne-moi|donne moi|photo de|image de|clip de|vidéo de|video de|chanson de|à quoi ressemble|a quoi ressemble|quelle est|quel est|où se trouve|ou se trouve|calcule|calculer|résous|resous)\s+/i,
+    /^(?:(?:parle[- ]moi de|montre[- ]moi|trouve[- ]moi|donne[- ]moi|a quoi ressemble|à quoi ressemble|ou se trouve|où se trouve|qui est|c'est qui|c’est qui|qui était|cherche|trouve|montre|photo de|image de|clip de|video de|vidéo de|chanson de|quelle est|quel est)\s+)/i,
     ""
   ).trim();
 
-  const capitalSeq = m.match(/\b([A-ZÀ-Ý][a-zà-ÿ]+(?:\s+[A-ZÀ-Ý][a-zà-ÿ]+){0,3})\b/g);
-  if (capitalSeq && capitalSeq.length > 0) {
-    return capitalSeq.sort((a, b) => b.length - a.length)[0];
-  }
+  // Enlever les déterminants et mots de liaison précédant le sujet visuel.
+  m = m.replace(/^(?:(?:la|le|les|un|une|des|du|de|d')\s+)+/i, "");
+  m = m.replace(/^(?:commune de|ville de|province de|quartier de|institut de|universite de|université de)\s+/i, "");
+  m = m.trim();
+  if (!m) return "";
 
-  return m.split(/\s+/).slice(0, 8).join(" ").slice(0, 60);
+  // Les acronymes (ISTA, UNIKIN...) et les noms en minuscules doivent être conservés.
+  // On ne choisit plus arbitrairement le premier mot capitalisé de la phrase.
+  return m.split(/\s+/).slice(0, 6).join(" ").slice(0, 80);
 }
 
 function normalizeForMatch(s) {
