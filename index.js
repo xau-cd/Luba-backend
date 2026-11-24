@@ -1,8 +1,8 @@
 // ================================================================================
-// v18.0.0 + LUBA ENGINE (ajout ciblé, optionnel) — luba-engine.js + luba_worker.py : analyse / correction de fichiers sur copie de
+// v18.1.0 + LUBA ENGINE (ajout ciblé, optionnel) — luba-engine.js + luba_worker.py : analyse / correction de fichiers sur copie de
 //   travail, contrôles de code réels, ZIP contrôlés. Points d'intégration repérés par « [LUBA ENGINE] » ; désactivable : ENGINE_ENABLED=false.
 // ================================================================================
-// v18.0.0 — CHANGEMENTS (par rapport à v17.2.0)
+// v18.1.0 — OPTIMISATION LATENCE + BUDGET GLOBAL (base v18.0.0)
 //  1. STABILITÉ : limites de jetons des modèles lues dans l'erreur 413/TPM et mémorisées (nouvel essai réduit, même modèle) ;
 //     400 « tool_use_failed » → nouvel essai SANS outils ; réponse vide d'un modèle de raisonnement → effort réduit ;
 //     réponse coupée par la limite de jetons → continuation automatique ; réponse de SECOURS si toute la chaîne échoue ;
@@ -13,8 +13,8 @@
 //  3. NOUVELLES SOURCES : youtube_search · youtube_video_info (youtubei.js) · tiktok_search · google_search (OpenSERP).
 //  4. NGANDU v250 : double modèle (architecte raisonnement → constructeur code), prompts « site web pro » et « code pro »,
 //     sorties longues jamais tronquées. 5. SOURCES : icône officielle du site pour chaque source, en fin de message.
-//  6. LUBA LIVE : file prioritaire, prompt vocal, jetons nettoyés pour la voix (ni markdown, ni URL, ni émoji, ni « Sources »),
-//     1re phrase lue plus tôt, voix française, audio terminé avant le signal DONE.
+//  6. PERFORMANCE : file de demandes maîtrisée, voie rapide pour questions factuelles, budget partagé générations/tokens,
+//     sorties courtes par défaut, architecte réservé au code/site complexe, extraction mémoire facultative.
 // ================================================================================
 // ================================================================================
 // LUBA AI PRO — BACKEND v18.0.0 « PRO MAX » — Run-Based Architecture + module héritage v16.5
@@ -85,6 +85,8 @@ function tryRequire(name) { try { return require(name); } catch { return null; }
 
 const dotenv = tryRequire("dotenv");
 if (dotenv && typeof dotenv.config === "function") dotenv.config();
+// Budget transversal partagé entre architecte, génération principale, outils et secours.
+const operationBudgetLib = tryRequire("./llm-operation-budget") || null;
 
 const path = require("path");
 const fs = require("fs");
@@ -395,7 +397,7 @@ const CONFIG = deepFreeze({
   LIMITS: {
     MAX_MESSAGE_LENGTH: envInt("MAX_MESSAGE_LENGTH", 15000),
     MAX_CONTEXT_MESSAGES: envInt("MAX_CONTEXT_MESSAGES", 24),
-    CONTEXT_TOKEN_BUDGET: envInt("CONTEXT_TOKEN_BUDGET", 9000),
+    CONTEXT_TOKEN_BUDGET: envInt("CONTEXT_TOKEN_BUDGET", 4500),
     MAX_IMAGES_PER_REQUEST: envInt("MAX_IMAGES_PER_REQUEST", 3),
     MAX_IMAGE_SIZE_MB: envInt("MAX_IMAGE_SIZE_MB", 10),
     MAX_PAGE_SIZE: envInt("MAX_PAGE_SIZE", 200),
@@ -408,12 +410,12 @@ const CONFIG = deepFreeze({
 
   // File d'attente / concurrence — le cœur de la stabilité sous charge
   QUEUE: {
-    GLOBAL_CONCURRENCY: envInt("RUN_GLOBAL_CONCURRENCY", 24),
-    HEAVY_CONCURRENCY: envInt("RUN_HEAVY_CONCURRENCY", 6),
+    GLOBAL_CONCURRENCY: envInt("RUN_GLOBAL_CONCURRENCY", 12),
+    HEAVY_CONCURRENCY: envInt("RUN_HEAVY_CONCURRENCY", 3),
     PER_USER_CONCURRENCY: envInt("RUN_PER_USER_CONCURRENCY", 2),
     PER_USER_QUEUED: envInt("RUN_PER_USER_QUEUED", 4),
-    MAX_QUEUE: envInt("RUN_MAX_QUEUE", 400),
-    MAX_WAIT_MS: envInt("RUN_MAX_QUEUE_WAIT_MS", 600000),
+    MAX_QUEUE: envInt("RUN_MAX_QUEUE", 120),
+    MAX_WAIT_MS: envInt("RUN_MAX_QUEUE_WAIT_MS", 120000),
     EVENT_BUFFER: envInt("RUN_EVENT_BUFFER", 4000),
     KEEP_FINISHED_MS: envInt("RUN_KEEP_FINISHED_MS", 120000),
     CHECKPOINT_MS: envInt("RUN_CHECKPOINT_MS", 2000)
@@ -423,14 +425,14 @@ const CONFIG = deepFreeze({
   // sans qu'on le considère en panne tant que le flux reste vivant.
   TIMEOUTS: {
     LIGHT: {
-      FIRST_TOKEN_MS: envInt("LIGHT_FIRST_TOKEN_MS", 30000),
-      IDLE_MS: envInt("LIGHT_IDLE_MS", 90000),
-      TOTAL_MS: envInt("LIGHT_TOTAL_MS", 240000)
+      FIRST_TOKEN_MS: envInt("LIGHT_FIRST_TOKEN_MS", 12000),
+      IDLE_MS: envInt("LIGHT_IDLE_MS", 45000),
+      TOTAL_MS: envInt("LIGHT_TOTAL_MS", 75000)
     },
     HEAVY: {
-      FIRST_TOKEN_MS: envInt("HEAVY_FIRST_TOKEN_MS", 300000),
-      IDLE_MS: envInt("HEAVY_IDLE_MS", 240000),
-      TOTAL_MS: envInt("HEAVY_TOTAL_MS", 600000)
+      FIRST_TOKEN_MS: envInt("HEAVY_FIRST_TOKEN_MS", 45000),
+      IDLE_MS: envInt("HEAVY_IDLE_MS", 90000),
+      TOTAL_MS: envInt("HEAVY_TOTAL_MS", 180000)
     },
     LIVE: {
       FIRST_TOKEN_MS: envInt("LIVE_FIRST_TOKEN_MS", 8000),
@@ -447,13 +449,13 @@ const CONFIG = deepFreeze({
   // toutes clés confondus (essai, nouvel essai, rotation de clé, réduction de contexte, essai sans outils, continuation d'un flux coupé).
   // Le compteur n'est JAMAIS remis à zéro quand on change de modèle, de clé ou de fournisseur. Un tour d'agent = une nouvelle génération.
   LLM_BUDGET: {
-    MAX_ATTEMPTS: envInt("LLM_MAX_ATTEMPTS", 5, 1, 20),            // tentatives maximales par génération
-    WAIT_ROUNDS: envInt("LLM_WAIT_ROUNDS", 4, 0, 8),                 // [PERF] relances « on patiente » après une panne passagère (avant : 8)
-    WAIT_MAX_MS: envInt("LLM_WAIT_MAX_MS", 15000, 1000, 30000),      // [PERF] pause maximale entre deux relances (avant : 30 s)
-    MAX_TOTAL_MS: envInt("LLM_MAX_TOTAL_MS", 300000, 2000, 900000) // durée totale maximale d'une opération (5 min) : plafonne AUSSI les deadlines des appelants
+    MAX_ATTEMPTS: envInt("LLM_MAX_ATTEMPTS", 3),            // tentatives maximales par génération
+    WAIT_ROUNDS: envInt("LLM_WAIT_ROUNDS", 1),                 // [PERF] relances « on patiente » après une panne passagère (avant : 8)
+    WAIT_MAX_MS: envInt("LLM_WAIT_MAX_MS", 3000),      // [PERF] pause maximale entre deux relances (avant : 30 s)
+    MAX_TOTAL_MS: envInt("LLM_MAX_TOTAL_MS", 180000) // durée totale maximale d'une opération (5 min) : plafonne AUSSI les deadlines des appelants
   },
   AGENT: {
-    MAX_ITERATIONS: envInt("AGENT_MAX_ITERATIONS", 5),   // tours d'agent (génération → outils → génération) : budget DISTINCT des tentatives LLM
+    MAX_ITERATIONS: envInt("AGENT_MAX_ITERATIONS", 3),   // tours d'agent (génération → outils → génération) : budget DISTINCT des tentatives LLM
     MAX_TOOL_CALLS_PER_STEP: envInt("AGENT_MAX_TOOL_CALLS_PER_STEP", 6),
     TOOL_BUDGET_MS: envInt("TOOL_BUDGET_MS", 25000),     // temps cumulé max passé en outils par réponse
     LIVE_MAX_ITERATIONS: envInt("LIVE_MAX_ITERATIONS", 2),
@@ -511,7 +513,7 @@ const CONFIG = deepFreeze({
     MAX_ATTEMPTS: envInt("MIRROR_MAX_ATTEMPTS", 12)
   },
 
-  MEMORY_EXTRACT: envBool("MEMORY_EXTRACT", true),
+  MEMORY_EXTRACT: envBool("MEMORY_EXTRACT", false),
   LIVE: { MAX_TOKENS: envInt("LIVE_MAX_TOKENS", 380) },
   DUAL: { ENABLED: envBool("DUAL_MODEL", true), PLAN_TIMEOUT_MS: envInt("DUAL_PLAN_TIMEOUT_MS", 40000), PLAN_MAX_TOKENS: envInt("DUAL_PLAN_MAX_TOKENS", 1500) },
   IMAGES_ONLY: { COUNT: envInt("IMAGES_ONLY_COUNT", 16) },
@@ -2368,11 +2370,11 @@ const toolTokens = (tools) => (tools && tools.length ? Math.min(6000, estimateTo
  *   • 400 avec outils (ex. « tool_use_failed ») : on réessaie SANS outils ;
  *   • réponse vide d'un modèle de raisonnement (tout dépensé en « réflexion ») : on réessaie avec un effort plus bas.
  */
-async function callLLM({ chain, messages, tools, images, lane, signal, deadlineAt, emit, toolChoice = null, profile = null, maxAttempts = null }) {
+async function callLLM({ chain, messages, tools, images, lane, signal, deadlineAt, emit, toolChoice = null, profile = null, maxAttempts = null, operationBudget = null }) {
   // [audit] plafond ABSOLU de durée, quel que soit le deadline demandé par l'appelant (un job « lourd » pouvait durer 10 min)
   const callStartedAt = now();
   deadlineAt = Math.min(deadlineAt, callStartedAt + CONFIG.LLM_BUDGET.MAX_TOTAL_MS);
-  const attemptsMax = Math.max(1, maxAttempts || CONFIG.LLM_BUDGET.MAX_ATTEMPTS);
+  const attemptsMax = Math.max(1, Math.min(3, maxAttempts || CONFIG.LLM_BUDGET.MAX_ATTEMPTS));
   let attemptsUsed = 0;
   const T = profile === "live" ? CONFIG.TIMEOUTS.LIVE : lane === "heavy" ? CONFIG.TIMEOUTS.HEAVY : CONFIG.TIMEOUTS.LIGHT;
   const { healthy, lastResort } = health.rank(chain);
@@ -2386,7 +2388,10 @@ async function callLLM({ chain, messages, tools, images, lane, signal, deadlineA
     const cfg = PROVIDERS[pc.provider];
     const pool = keyPools[pc.provider];
     const learned = activeLimits(pc);
-    let pcx = learned?.maxTokens ? { ...pc, maxTokens: Math.min(pc.maxTokens, learned.maxTokens) } : pc;
+    const outputCeiling = profile === "live" ? CONFIG.LIVE.MAX_TOKENS
+      : lane === "heavy" ? envInt("HEAVY_MAX_OUTPUT_TOKENS", 6500)
+      : envInt("LIGHT_MAX_OUTPUT_TOKENS", 1600);
+    let pcx = { ...pc, maxTokens: Math.min(pc.maxTokens, outputCeiling, learned?.maxTokens || Infinity) };
     let workHere = learned?.ctx ? fitContext(messages, learned.ctx).messages : messages;
     let toolsHere = learned?.noTools ? null : tools;
     let effort = pc.reasoningEffort;
@@ -2425,11 +2430,36 @@ async function callLLM({ chain, messages, tools, images, lane, signal, deadlineA
         ? [...workHere, { role: "assistant", content: committed }, { role: "user", content: CONTINUE_PROMPT }]
         : workHere;
 
-      attemptsUsed++;   // [audit] compté AVANT l'appel : un appel qui échoue brutalement consomme sa tentative
+      // Un budget unique par requête évite que retries + outils + continuation + secours multiplient les générations.
+      if (operationBudget && operationBudgetLib) {
+        const gate = operationBudgetLib.tryConsumeGeneration(operationBudget, now(), deadlineAt);
+        if (!gate.ok) {
+          wd.stop(); health.release(pc);
+          lastErr = new ProviderError(gate.code === "OPERATION_TIMEOUT" ? "timeout_total" : "server", gate.message);
+          lastErr.exhausted = gate.code || "operation_budget";
+          break providers;
+        }
+        const promptEstimate = estimateTokens(safeJsonStringify(sendMessages)) + toolTokens(toolsHere);
+        const tokenGate = operationBudgetLib.reserveTokens
+          ? operationBudgetLib.reserveTokens(operationBudget, promptEstimate, pcx.maxTokens)
+          : { ok: true, maxOutputTokens: pcx.maxTokens };
+        if (!tokenGate.ok) {
+          wd.stop(); health.release(pc);
+          lastErr = new ProviderError("context", tokenGate.message || "Budget de tokens de cette opération atteint");
+          lastErr.exhausted = "tokens";
+          break providers;
+        }
+        pcx = { ...pcx, maxTokens: Math.max(128, Math.min(pcx.maxTokens, tokenGate.maxOutputTokens || pcx.maxTokens)) };
+      }
+      attemptsUsed++;   // compté avant l'appel : un appel échoué consomme sa tentative
       try {
         emit.status("generating", { provider: pc.provider, model: pc.model, attempt: attemptsUsed });
         const streamer = cfg.kind === "gemini" ? streamGemini : cfg.kind === "fake" ? streamFake : streamOpenAI;
         const r = await streamer({ pc: { ...pcx, reasoningEffort: effort }, cfg, key, messages: sendMessages, tools: toolsHere, images, wd, h, toolChoice });
+        if (operationBudget && operationBudgetLib?.recordOutputTokens) {
+          const usedOut = r.usage?.completion_tokens || r.usage?.completionTokenCount || estimateTokens(visible);
+          operationBudgetLib.recordOutputTokens(operationBudget, usedOut);
+        }
         const tail = filter.flush();
         if (tail.text) { visible += tail.text; emit.token(tail.text); }
         if (tail.reasoning) emit.reasoning(tail.reasoning);
@@ -2454,7 +2484,10 @@ async function callLLM({ chain, messages, tools, images, lane, signal, deadlineA
         if (err.kind !== "model" || !lastErr || lastErr.kind === "model") lastErr = err;
         noteLlmError(pc, err);
         logger.warn({ provider: pc.provider, model: pc.model, kind: err.kind, status: err.status, attempt, msg: redactSecrets(err.message).slice(0, 200) }, "appel LLM échoué");
-        if (visible) committed += visible;     // déjà vu par l'utilisateur → on continuera, sans rejouer
+        if (visible) {
+          if (operationBudget && operationBudgetLib?.recordOutputTokens) operationBudgetLib.recordOutputTokens(operationBudget, estimateTokens(visible));
+          committed += visible;     // déjà vu par l'utilisateur → on continuera, sans rejouer
+        }
 
         // ---- [FIX] modèle retiré (404) : instantané → ne consomme pas le budget de tentatives, écarté 6 h, remplacement automatique ----
         if (err.kind === "model") {
@@ -2514,7 +2547,7 @@ async function callLLM({ chain, messages, tools, images, lane, signal, deadlineA
 
 const stableStringify = (o) => safeJsonStringify(o, "{}");
 
-async function orchestrate({ chain, lane, messages, images, tools, executeTool, signal, deadlineAt, emit, profile = null, maxIterations = null, toolTimeoutMs = null }) {
+async function orchestrate({ chain, lane, messages, images, tools, executeTool, signal, deadlineAt, emit, profile = null, maxIterations = null, toolTimeoutMs = null, operationBudget = null }) {
   const working = [...messages];
   const sources = new Set(), imagesOut = [], videosOut = [], trace = [], segments = [];
   const toolCache = new Map();
@@ -2526,7 +2559,7 @@ async function orchestrate({ chain, lane, messages, images, tools, executeTool, 
   // [PERF] Le budget de 9000 jetons couvre l'HISTORIQUE ; le prompt système (≈ 8 000 jetons, toujours conservé) s'y ajoute au lieu de
   // l'écraser : avant, fitContext n'avait plus de place et supprimait toute la conversation (le modèle « oubliait » le fil).
   const sysTokens = () => working.filter((m) => m.role === "system").reduce((a, m) => a + estimateTokens(typeof m.content === "string" ? m.content : safeJsonStringify(m.content)) + 6, 0);
-  const ctxBudget = () => sysTokens() + Math.max(3000, CONFIG.LIMITS.CONTEXT_TOKEN_BUDGET - toolTokens(tools));   // les schémas d'outils comptent dans le prompt
+  const ctxBudget = () => sysTokens() + Math.max(1800, (lane === "heavy" ? 6000 : CONFIG.LIMITS.CONTEXT_TOKEN_BUDGET) - toolTokens(tools));   // les schémas d'outils comptent dans le prompt
 
   const addUsage = (u) => {
     if (!u) return;
@@ -2564,7 +2597,7 @@ async function orchestrate({ chain, lane, messages, images, tools, executeTool, 
   for (let it = 1; it <= maxIt; it++) {
     emit.status(it === 1 ? "thinking" : "reasoning", { iteration: it });
     const fitted = fitContext(working, ctxBudget());
-    let r = await callLLM({ chain, messages: fitted.messages, tools, images, lane, signal, deadlineAt, emit, profile });
+    let r = await callLLM({ chain, messages: fitted.messages, tools, images, lane, signal, deadlineAt, emit, profile, operationBudget });
     provider = r.provider; model = r.model; ttftMs = ttftMs ?? r.ttftMs; reasoning += r.reasoning || ""; addUsage(r.usage);
 
     // v18 : réponse COUPÉE par la limite de jetons (code / site web longs) → on poursuit automatiquement, sans répéter.
@@ -2575,7 +2608,7 @@ async function orchestrate({ chain, lane, messages, images, tools, executeTool, 
       const sysMsgs = fitted.messages.filter((m) => m.role === "system");
       const lastUser = [...fitted.messages].reverse().find((m) => m.role === "user");
       const contMsgs = [...sysMsgs, ...(lastUser ? [lastUser] : []), { role: "assistant", content: clipMiddle(r.text, 7000) }, { role: "user", content: CONTINUE_PROMPT }];
-      const more = await callLLM({ chain, messages: contMsgs, tools: null, images: null, lane, signal, deadlineAt, emit, profile });
+      const more = await callLLM({ chain, messages: contMsgs, tools: null, images: null, lane, signal, deadlineAt, emit, profile, operationBudget });
       addUsage(more.usage);
       provider = more.provider; model = more.model;
       r = { ...more, text: r.text + more.text, toolCalls: [], reasoning: r.reasoning };
@@ -3735,8 +3768,9 @@ const TOOL_ROUTES = [
   [/bourse|\baction\b|stock|nasdaq|cac ?40|tesla|apple|cours de/i, /stock|finance/],
   [/match|score|foot|ligue|\bnba\b|classement|champion|coupe|sport/i, /sport|score/],
   [/article|[ée]tude|scientifique|science|paper|arxiv|\bdoi\b|publication|chercheur|th[èe]se/i, /science|openalex|crossref|arxiv|scholar/],
+  [/(tu\s+connais|connais[- ]tu|qui\s+est|pr[ée]sente[- ]moi|informations?\s+sur|renseignements?\s+sur).*(institut|universit[ée]|[ée]cole|organisme|entreprise|centre|[ée]tablissement)|\b(institut\s+sup[ée]rieur|universit[ée]|[ée]cole\s+sup[ée]rieure)\b/i, /^(web_fast|google_search|search_wikipedia|wikidata_lookup)$/],
   [/livre|roman|auteur|isbn|biblioth[èe]que|[ée]crivain/i, /openlibrary|book/],
-  [/pharmacie|h[ôo]pital|clinique|restaurant|banque|\batm\b|station|[ée]cole|universit[ée]|police|march[ée]|h[ôo]tel|pr[èe]s de|proche|autour|adresse|o[uù] (se trouve|est)|coordonn[ée]es|gps|carte|itin[ée]raire|distance/i, /osm_|map|place|geo/],
+  [/pharmacie|h[ôo]pital|clinique|restaurant|banque|\batm\b|station|police|march[ée]|h[ôo]tel|pr[èe]s de|proche|autour|adresse|o[uù] (se trouve|est)|coordonn[ée]es|gps|carte|itin[ée]raire|distance/i, /osm_|map|place|geo/],
   [/population|\bpib\b|\bgdp\b|inflation|esp[ée]rance|ch[ôo]mage|statistique|habitants|banque mondiale|pays/i, /worldbank/],
   [/chanson|musique|album|artiste|chanteur|chanteuse|paroles|song|track|single|clip|concert|playlist/i, /deezer|itunes|youtube|music/],
   [/vid[ée]o|youtube|tuto|film|bande[- ]annonce|trailer|regarder/i, /youtube|video/],
@@ -4529,7 +4563,7 @@ function buildHistory(rows, userIdx, { live = false } = {}) {
 }
 
 // ---------- Double modèle (Ngandu v250) : architecte (raisonnement) puis constructeur ----------
-async function architectPlan({ messages, intent, signal, deadlineAt, emit }) {
+async function architectPlan({ messages, intent, signal, deadlineAt, emit, operationBudget = null }) {
   const chain = tierChain("v250", { hasImages: false, code: false }).map((pc) => ({ ...pc, maxTokens: Math.min(pc.maxTokens, CONFIG.DUAL.PLAN_MAX_TOKENS), temperature: 0.4 }));
   if (!chain.length) return null;
   const ctx = messages.filter((m) => m.role !== "system").slice(-5);
@@ -4538,13 +4572,13 @@ async function architectPlan({ messages, intent, signal, deadlineAt, emit }) {
   let planText = "";
   const quiet = { status() {}, token: (t) => { planText += t; }, reasoning() {}, images() {}, videos() {}, code() {} };
   emit.status("planning", { intent });
-  const r = await callLLM({ chain, messages: [{ role: "system", content: ARCHITECT_PROMPTS[intent] || ARCHITECT_PROMPTS.DEFAULT }, ...ctx], tools: null, images: null, lane: "heavy", signal, deadlineAt: Math.min(deadlineAt, now() + CONFIG.DUAL.PLAN_TIMEOUT_MS), emit: quiet });
+  const r = await callLLM({ chain, messages: [{ role: "system", content: ARCHITECT_PROMPTS[intent] || ARCHITECT_PROMPTS.DEFAULT }, ...ctx], tools: null, images: null, lane: "heavy", signal, deadlineAt: Math.min(deadlineAt, now() + CONFIG.DUAL.PLAN_TIMEOUT_MS), emit: quiet, operationBudget });
   const text = formatFinalReply(r.text || planText);
   return text.length > 40 ? text.slice(0, 6000) : null;
 }
 
 // ---------- Réponse de SECOURS : si toute la chaîne échoue, on tente un dernier passage simplifié ----------
-async function rescueAnswer({ messages, hasImages, signal, emit, cause }) {
+async function rescueAnswer({ messages, hasImages, signal, emit, cause, operationBudget = null }) {
   const seen = new Set(), chain = [];
   for (const pc of [...TIERS.v100.chain, ...TIERS.v250.chain, ...TIERS.v250.code]) {
     const k = limitKey(pc);
@@ -4560,7 +4594,7 @@ async function rescueAnswer({ messages, hasImages, signal, emit, cause }) {
   const last = tail[tail.length - 1];
   last.content = clipMiddle(last.content, 3500) + (hasImages ? "\n\n[NOTE SYSTÈME : l'image jointe n'a pas pu être analysée (service de vision momentanément indisponible). Dis-le brièvement, puis réponds du mieux possible à la partie texte de la demande.]" : "");
   emit.status("rescue", {});
-  const r = await callLLM({ chain, messages: [...sys, ...tail], tools: null, images: null, lane: "light", signal, deadlineAt: now() + CONFIG.RESCUE.TIMEOUT_MS, emit, maxAttempts: CONFIG.RESCUE.MAX_ATTEMPTS });
+  const r = await callLLM({ chain, messages: [...sys, ...tail], tools: null, images: null, lane: "light", signal, deadlineAt: now() + CONFIG.RESCUE.TIMEOUT_MS, emit, maxAttempts: CONFIG.RESCUE.MAX_ATTEMPTS, operationBudget });
   return { text: r.text, reasoning: "", sources: [], images: [], videos: [], trace: [], provider: r.provider, model: r.model, ttftMs: r.ttftMs, usage: { prompt: 0, completion: 0 }, partial: r.partial, error: r.error || null, rescued: true };
 }
 /** Ferme un bloc de code resté ouvert (réponse coupée) pour que l'affichage ne casse pas. */
@@ -4684,6 +4718,7 @@ const chat = {
     let deadlineAt = now() + Math.min(T.TOTAL_MS, CONFIG.LLM_BUDGET.MAX_TOTAL_MS);      // ajusté plus bas selon la nature de la demande ; plafonné par LLM_MAX_TOTAL_MS (5 min)
     const signal = run.controller.signal;
     const startedAt = now();
+    let operationBudget = null;
     const speech = live ? new SpeechSanitizer() : null;     // Luba Live : on ne laisse passer que du texte « parlable »
     const emit = {
       status: (stage, extra) => run.push("status", { stage, ...extra }),
@@ -4721,10 +4756,19 @@ const chat = {
       const pre = legacy?.preRouteIntent ? (() => { try { return legacy.preRouteIntent(run.message); } catch { return null; } })() : null;
       const intent = refineIntent(pre?.intent && pre.intent !== "GENERAL" ? pre.intent : quickIntent(run.message), run.message, { hasDocs: Boolean(run.docs?.length) });
       const entity = pre?.entity ?? null;
-      // Durée accordée : message ordinaire 4 min ; code / site web / document / très long message 10 min
+      // Durée accordée : 75 s pour le chat ordinaire ; jusqu’à 180 s pour les tâches lourdes
       const bigJob = !live && (["CODE", "WEBSITE", "DOCUMENT"].includes(intent) || run.message.length > 1500 || Boolean(run.docs?.length));
       const tlane = bigJob ? "heavy" : "light";
       if (!live) deadlineAt = now() + Math.min((bigJob ? CONFIG.TIMEOUTS.HEAVY : CONFIG.TIMEOUTS.LIGHT).TOTAL_MS, CONFIG.LLM_BUDGET.MAX_TOTAL_MS);
+      if (!live && operationBudgetLib?.createOperationBudget) {
+        operationBudget = operationBudgetLib.createOperationBudget({
+          startedAt, deadlineAt,
+          maxAttempts: envInt("LLM_MAX_OPERATION_GENERATIONS", 5),
+          maxDurationMs: deadlineAt - startedAt,
+          maxInputTokens: envInt("LLM_OPERATION_MAX_INPUT_TOKENS", 24000),
+          maxOutputTokens: envInt("LLM_OPERATION_MAX_OUTPUT_TOKENS", 6500)
+        });
+      }
       const imgReq = !live && !(run.images && run.images.length) && !run.docs?.length && isImageSearchRequest(run.message);   // « montre-moi des images de … » : galerie seule
       const wantsEnrich = !live && !imgReq && !["SMALLTALK", "CODE", "GENERAL", "WEBSITE", "DOCUMENT", "MATH"].includes(intent) && legacy?.enrichContextWithIntent;
 
@@ -4796,8 +4840,8 @@ const chat = {
 
       // NGANDU v250 — double modèle : un architecte (raisonnement) prépare un plan, le constructeur (code) l'exécute.
       if (!live && !hasImages && run.tier === "v250" && CONFIG.DUAL.ENABLED && !CONFIG.FAKE_LLM
-          && (["CODE", "WEBSITE", "DOCUMENT", "MATH"].includes(intent) || run.message.length > 700 || run.docs?.length)) {
-        const plan = await settle(architectPlan({ messages, intent, signal, deadlineAt, emit }), CONFIG.DUAL.PLAN_TIMEOUT_MS + 2000, null);
+          && (["CODE", "WEBSITE"].includes(intent) && (run.message.length > 450 || Boolean(run.docs?.length)))) {
+        const plan = await settle(architectPlan({ messages, intent, signal, deadlineAt, emit, operationBudget }), CONFIG.DUAL.PLAN_TIMEOUT_MS + 1000, null);
         if (plan && !signal.aborted) {
           const lastUser = messages[messages.length - 1];
           lastUser.content += `\n\n[PLAN DE L'ARCHITECTE — document interne : applique-le avec rigueur, ne le recopie pas et ne mentionne pas son existence]\n${plan}`;
@@ -4816,7 +4860,8 @@ const chat = {
           out = await orchestrate({
             chain, lane: live ? run.lane : tlane, messages, images: run.images && run.images.length ? run.images : null, tools,
             executeTool: (call) => executeTool(call, ctx), signal, deadlineAt, emit,
-            profile: live ? "live" : null, maxIterations: live ? CONFIG.AGENT.LIVE_MAX_ITERATIONS : null, toolTimeoutMs: live ? CONFIG.TIMEOUTS.LIVE_TOOL_MS : null
+            profile: live ? "live" : null, maxIterations: live ? CONFIG.AGENT.LIVE_MAX_ITERATIONS : null, toolTimeoutMs: live ? CONFIG.TIMEOUTS.LIVE_TOOL_MS : null,
+            operationBudget
           });
           break;
         } catch (e) {
@@ -4831,7 +4876,7 @@ const chat = {
             continue;
           }
           logger.warn({ runId: run.id, kind: e.kind, provider: e.provider }, "orchestration échouée → réponse de secours");
-          out = await rescueAnswer({ messages, hasImages, signal, emit, cause: e });
+          out = await rescueAnswer({ messages, hasImages, signal, emit, cause: e, operationBudget });
           break;
         }
       }
@@ -4846,7 +4891,7 @@ const chat = {
       };
       let fin = finalize(out);
       if (!fin.text && !out.rescued) {     // réponse vide : dernier passage de secours avant d'abandonner
-        out = await rescueAnswer({ messages, hasImages, signal, emit, cause: new ProviderError("empty", "réponse vide") });
+        out = await rescueAnswer({ messages, hasImages, signal, emit, cause: new ProviderError("empty", "réponse vide"), operationBudget });
         fin = finalize(out);
       }
       let finalText = fin.text;
@@ -4893,6 +4938,7 @@ const chat = {
         modelTier: run.tier, visionEnabled: hasImages, intent, language: run.language, contextLength: history.length,
         elapsedMs, ttftMs: out.ttftMs, queueMs: run.queueMs, adIncluded: Boolean(ad), imagesGuaranteed: Boolean(guaranteed?.images?.length),
         suggestions: sug.suggestions, sources: srcList, toolCallTrace: out.trace, usage: out.usage,
+        operationBudget: operationBudget ? { generations: operationBudget.attempts, maxGenerations: operationBudget.maxAttempts, inputTokensEstimated: operationBudget.inputTokens || 0, outputTokensReserved: operationBudget.outputTokens || 0 } : null,
         images: imageUrls, media: { images: imageUrls, videos: out.videos }
       };
       run.push("done", result);
