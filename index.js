@@ -1812,35 +1812,35 @@ const TIERS = {
     lane: "light",
     chain: [
       mk("groq", envStr("GROQ_MODEL_V100", "openai/gpt-oss-120b")),
-      mk("gemini", envStr("GEMINI_MODEL_V100", "gemini-2.5-flash"), { maxTokens: 8000 }),
+      mk("gemini", envStr("GEMINI_MODEL_V100", "gemini-3.8-flash"), { maxTokens: 8000 }),
       mk("cerebras", envStr("CEREBRAS_MODEL_V100", "qwen-3.8-27b")),
-      mk("gemini2", envStr("GEMINI2_MODEL_V100_FALLBACK_1", "gemini-2.5-flash"), { maxTokens: 8000 }),            // remplace OpenRouter
-      mk("gemini2", envStr("GEMINI2_MODEL_V100_FALLBACK_2", "gemini-2.5-flash-lite"), { maxTokens: 8000 }),       // remplace OpenRouter
+      mk("gemini2", envStr("GEMINI2_MODEL_V100_FALLBACK_1", "gemini-3.8-flash"), { maxTokens: 8000 }),            // remplace OpenRouter
+      mk("gemini2", envStr("GEMINI2_MODEL_V100_FALLBACK_2", "gemini-3.5-flash-lite"), { maxTokens: 8000 }),       // remplace OpenRouter
       mk("groq", envStr("GROQ_MODEL_V100_FALLBACK", "llama-3.1-8b-instant")),                     // quota séparé de gpt-oss : filet de sécurité rapide
-      mk("gemini", envStr("GEMINI_MODEL_V100_FALLBACK", "gemini-2.5-flash-lite"), { maxTokens: 8000 })
+      mk("gemini", envStr("GEMINI_MODEL_V100_FALLBACK", "gemini-3.5-flash-lite"), { maxTokens: 8000 })
     ]
   },
   v250: {
     lane: "heavy",
     chain: [
       mk("groq", envStr("GROQ_MODEL_V250_REASONING", "openai/gpt-oss-120b"), { maxTokens: 8000, temperature: 0.6, reasoningEffort: "high" }),
-      mk("gemini2", envStr("GEMINI2_MODEL_V250_REASONING", "gemini-2.5-pro"), { maxTokens: 8000, temperature: 0.4 }),   // remplace OpenRouter (DeepSeek R1)
-      mk("gemini", envStr("GEMINI_MODEL_V250_REASONING", "gemini-2.5-flash"), { maxTokens: 8000, temperature: 0.3 }),
+      mk("gemini2", envStr("GEMINI2_MODEL_V250_REASONING", "gemini-3.1-pro-preview"), { maxTokens: 8000, temperature: 0.4 }),   // remplace OpenRouter (DeepSeek R1)
+      mk("gemini", envStr("GEMINI_MODEL_V250_REASONING", "gemini-3.8-flash"), { maxTokens: 8000, temperature: 0.3 }),
       mk("groq", envStr("GROQ_MODEL_V250_FALLBACK", "llama-3.3-70b-versatile"), { maxTokens: 6000, temperature: 0.6 })
     ],
     code: [
       mk("groq", envStr("GROQ_MODEL_V250_CODE", "openai/gpt-oss-120b"), { maxTokens: envInt("CODE_MAX_TOKENS", 12000), temperature: 0.4 }),
       mk("cerebras", envStr("CEREBRAS_MODEL_V250_CODE", "qwen-3.8-27b"), { maxTokens: envInt("CODE_MAX_TOKENS", 12000), temperature: 0.4 }),
-      mk("gemini2", envStr("GEMINI2_MODEL_V250_CODE", "gemini-2.5-flash"), { maxTokens: envInt("CODE_MAX_TOKENS", 12000), temperature: 0.4 }),   // remplace OpenRouter (Qwen3 Coder)
-      mk("gemini", envStr("GEMINI_MODEL_V250_CODE", "gemini-2.5-flash"), { maxTokens: envInt("CODE_MAX_TOKENS", 12000), temperature: 0.4 })   // secours long-contexte
+      mk("gemini2", envStr("GEMINI2_MODEL_V250_CODE", "gemini-3.8-flash"), { maxTokens: envInt("CODE_MAX_TOKENS", 12000), temperature: 0.4 }),   // remplace OpenRouter (Qwen3 Coder)
+      mk("gemini", envStr("GEMINI_MODEL_V250_CODE", "gemini-3.8-flash"), { maxTokens: envInt("CODE_MAX_TOKENS", 12000), temperature: 0.4 })   // secours long-contexte
     ]
   },
   vision: {
     lane: "light",
     chain: [
       mk("groq", envStr("VISION_MODEL_GROQ", "meta-llama/llama-4-maverick-17b-128e-instruct")),
-      mk("gemini", envStr("VISION_MODEL_GEMINI", "gemini-2.5-flash")),
-      mk("gemini2", envStr("GEMINI2_MODEL_VISION", "gemini-2.5-flash"))                                          // remplace OpenRouter (Qwen-VL)
+      mk("gemini", envStr("VISION_MODEL_GEMINI", "gemini-3.8-flash")),
+      mk("gemini2", envStr("GEMINI2_MODEL_VISION", "gemini-3.8-flash"))                                          // remplace OpenRouter (Qwen-VL)
     ]
   }
 };
@@ -2297,9 +2297,21 @@ function clipMiddle(text, maxTokens) {
 }
 
 /** Garde le prompt sous le budget : système + dernier message toujours conservés, historique rogné par l'ancien. */
-function fitContext(messages, budgetTokens) {
+function fitContext(messages, budgetTokens, { clipSystem = false } = {}) {
   const tok = (m) => estimateTokens(typeof m.content === "string" ? m.content : safeJsonStringify(m.content)) + 6;
-  const sys = messages.filter((m) => m.role === "system");
+  let sys = messages.filter((m) => m.role === "system");
+  // [FIX 413/« trop long »] Si le prompt système (identité + mémoire + documents + sources) dépasse à lui seul la limite du modèle
+  // (ex. Groq gratuit : 8000 jetons/min), l'historique rogné ne suffisait pas : même requête réessayée, même 413. On rogne alors
+  // aussi le système (début = règles d'identité conservé, milieu omis, fin = contexte récent conservé). Uniquement en passage de secours.
+  if (clipSystem && sys.length) {
+    const sysBudget = Math.max(900, Math.floor(budgetTokens * 0.55));
+    const sysTotal = sys.reduce((a, m) => a + tok(m), 0);
+    if (sysTotal > sysBudget) {
+      const ratio = sysBudget / sysTotal;
+      sys = sys.map((m) => (typeof m.content === "string" ? { ...m, content: clipMiddle(m.content, Math.max(300, Math.floor(tok(m) * ratio))) } : m));
+      messages = [...sys, ...messages.filter((m) => m.role !== "system")];
+    }
+  }
   const rest = messages.filter((m) => m.role !== "system");
   if (!rest.length) return { messages, dropped: 0 };
   const last = rest[rest.length - 1];
@@ -2322,7 +2334,8 @@ const FRIENDLY = {
   timeout_first: "La réflexion a pris trop de temps. Réessaie, ou pose la question en plus court.",
   timeout_idle: "La connexion au modèle s'est interrompue. Réessaie dans un instant.",
   timeout_total: "La réponse a pris trop de temps. Réessaie avec une question plus ciblée.",
-  context: "Le message est trop long pour être traité. Raccourcis-le ou découpe-le.",
+  context: "Luba a trop d'éléments à traiter d'un coup. Réessaie, ou démarre une nouvelle discussion si le problème continue.",
+  server: "Luba rencontre une difficulté momentanée. Réessaie dans un instant.",
   auth: "Luba est momentanément indisponible (accès au modèle en cours de vérification). Réessaie un peu plus tard.",
   model: "Luba est momentanément indisponible (modèle en cours de mise à jour). Réessaie un peu plus tard.",
   network: "Luba n'arrive pas à joindre ses modèles pour le moment. Réessaie dans un instant.",
@@ -2392,7 +2405,7 @@ async function callLLM({ chain, messages, tools, images, lane, signal, deadlineA
       : lane === "heavy" ? envInt("HEAVY_MAX_OUTPUT_TOKENS", 6500)
       : envInt("LIGHT_MAX_OUTPUT_TOKENS", 1600);
     let pcx = { ...pc, maxTokens: Math.min(pc.maxTokens, outputCeiling, learned?.maxTokens || Infinity) };
-    let workHere = learned?.ctx ? fitContext(messages, learned.ctx).messages : messages;
+    let workHere = learned?.ctx ? fitContext(messages, learned.ctx, { clipSystem: true }).messages : messages;
     let toolsHere = learned?.noTools ? null : tools;
     let effort = pc.reasoningEffort;
     let attempt = 0, shrinks = 0, noToolRetry = false, effortRetry = false, guard = 0;
@@ -2426,7 +2439,7 @@ async function callLLM({ chain, messages, tools, images, lane, signal, deadlineA
         },
         onReasoning: (t) => { if (ttft === null) ttft = now() - startedAt; emit.reasoning(t); }
       };
-      const sendMessages = committed
+      let sendMessages = committed
         ? [...workHere, { role: "assistant", content: committed }, { role: "user", content: CONTINUE_PROMPT }]
         : workHere;
 
@@ -2435,14 +2448,29 @@ async function callLLM({ chain, messages, tools, images, lane, signal, deadlineA
         const gate = operationBudgetLib.tryConsumeGeneration(operationBudget, now(), deadlineAt);
         if (!gate.ok) {
           wd.stop(); health.release(pc);
-          lastErr = new ProviderError(gate.code === "OPERATION_TIMEOUT" ? "timeout_total" : "server", gate.message);
+          // [FIX] Garde la VRAIE cause (429, 413, timeout…) déjà observée : avant, « (réf : server) » écrasait tout et cachait le diagnostic.
+          const budgetErr = new ProviderError(gate.code === "OPERATION_TIMEOUT" ? "timeout_total" : "server", gate.message);
+          lastErr = lastErr && lastErr.kind !== "model" ? lastErr : budgetErr;
           lastErr.exhausted = gate.code || "operation_budget";
           break providers;
         }
         const promptEstimate = estimateTokens(safeJsonStringify(sendMessages)) + toolTokens(toolsHere);
-        const tokenGate = operationBudgetLib.reserveTokens
+        let tokenGate = operationBudgetLib.reserveTokens
           ? operationBudgetLib.reserveTokens(operationBudget, promptEstimate, pcx.maxTokens)
           : { ok: true, maxOutputTokens: pcx.maxTokens };
+        // [FIX « réf : context » sur un message court] Le prompt (système + outils + historique) était refusé tel quel par le budget de jetons.
+        // Avant d'abandonner : UN seul passage compacté (système rogné, historique réduit, sans outils, sortie plafonnée), budget toujours respecté.
+        if (!tokenGate.ok && operationBudgetLib.reserveTokens && !committed && !workHere.__compacted) {
+          const compact = fitContext(workHere, Math.max(1800, Math.floor(promptEstimate * 0.45)), { clipSystem: true }).messages;
+          compact.__compacted = true;
+          const compactEstimate = estimateTokens(safeJsonStringify(compact));
+          const retry = operationBudgetLib.reserveTokens(operationBudget, compactEstimate, Math.min(pcx.maxTokens, 1200));
+          if (retry.ok) {
+            logger.warn({ provider: pc.provider, model: pc.model, before: promptEstimate, after: compactEstimate }, "budget de jetons : prompt compacté (outils retirés) au lieu d'échouer");
+            workHere = compact; sendMessages = compact; toolsHere = null; tokenGate = retry;
+            pcx = { ...pcx, maxTokens: Math.min(pcx.maxTokens, 1200) };
+          }
+        }
         if (!tokenGate.ok) {
           wd.stop(); health.release(pc);
           lastErr = new ProviderError("context", tokenGate.message || "Budget de tokens de cette opération atteint");
@@ -2494,7 +2522,7 @@ async function callLLM({ chain, messages, tools, images, lane, signal, deadlineA
           attemptsUsed = Math.max(0, attemptsUsed - 1);
           health.ban(pc, CONFIG.HEALTH.MODEL_BAN_MS);
           logger.error({ provider: pc.provider, model: pc.model, status: err.status }, "modèle introuvable/retiré (404) → écarté ; changer la variable d'environnement du modèle ou laisser l'auto-réparation le remplacer");
-          queueModelHeal(pc);
+          queueModelHeal(pc, err);
           break;
         }
 
@@ -2508,7 +2536,7 @@ async function callLLM({ chain, messages, tools, images, lane, signal, deadlineA
           const targetTotal = lim.limit && lim.requested ? Math.floor(inTok * clamp(lim.limit / lim.requested, 0.2, 0.9) * 0.85) : Math.floor(inTok / 2);
           if (shrinks >= 2 || (lim.limit && lim.limit < 6000)) toolsHere = null;
           const msgBudget = Math.max(1200, targetTotal - (toolsHere ? tTok : 0));
-          workHere = fitContext(workHere, msgBudget).messages;
+          workHere = fitContext(workHere, msgBudget, { clipSystem: true }).messages;
           const room = lim.limit ? lim.limit - msgBudget - (toolsHere ? tTok : 0) - 300 : Math.floor(pcx.maxTokens / 2);
           pcx = { ...pcx, maxTokens: clamp(room, 512, pcx.maxTokens) };
           learnLimits(pc, { maxTokens: pcx.maxTokens, ctx: msgBudget, noTools: toolsHere === null && Boolean(tools?.length) });
@@ -2678,7 +2706,7 @@ async function diagnoseProviders({ timeoutMs = 12000 } = {}) {
       return { ...base, ok: true, latencyMs: now() - t0, sample: text.replace(/\s+/g, " ").trim().slice(0, 30) };
     } catch (e) {
       const err = e instanceof ProviderError ? e : new ProviderError(wd.signal.aborted ? (wd.reason || "timeout_total") : "network", String(e.message || e));
-      return { ...base, ok: false, kind: err.kind, status: err.status, message: redactSecrets(err.message).slice(0, 220), latencyMs: now() - t0 };
+      return { ...base, ok: false, kind: err.kind, status: err.status, message: redactSecrets(err.message).slice(0, 320), latencyMs: now() - t0 };
     } finally { wd.stop(); }
   }));
 }
@@ -2723,10 +2751,17 @@ async function probeModel(pc) {
     const streamer = cfg.kind === "gemini" ? streamGemini : streamOpenAI;
     await streamer({ pc: { ...pc, maxTokens: 24, temperature: 0 }, cfg, key, messages: [{ role: "user", content: "Réponds uniquement : OK" }], tools: null, images: null, wd, h });
     return true;
-  } catch { return false; } finally { wd.stop(); }
+  } catch (e) {
+    // [FIX] 429 (quota) / réponse vide = le modèle EXISTE ; seul un 404 prouve qu'il est retiré. Avant : un simple 429 de sonde excluait
+    // définitivement le bon remplaçant (ex. gemini-3.x-flash) jusqu'au prochain redémarrage.
+    return e instanceof ProviderError && (e.kind === "rate_limit" || e.kind === "empty");
+  } finally { wd.stop(); }
 }
 
 /** dead = [{provider, model}] confirmés en 404. Écarte, puis remplace si un modèle de la même famille répond. Retourne un rapport. */
+/** L'API Google nomme parfois elle-même le remplaçant : « …use models/gemini-3.8-flash for the latest… ». */
+const modelHintFromError = (msg) => { const m = /use\s+models\/([A-Za-z0-9._-]+)/i.exec(String(msg || "")); return m ? m[1] : null; };
+
 async function healDeadModels(dead) {
   if (!MODEL_AUTOHEAL || CONFIG.FAKE_LLM) return [];
   const allPcs = [...TIERS.v100.chain, ...TIERS.v250.chain, ...TIERS.v250.code, ...TIERS.vision.chain];
@@ -2738,7 +2773,8 @@ async function healDeadModels(dead) {
     for (const pc of allPcs) if (pc.provider === d.provider && pc.model === d.model) health.ban(pc, CONFIG.HEALTH.MODEL_BAN_MS);
     const fam = modelFamily(d.model);
     let chosen = null;
-    if (fam !== "other") {
+    if (d.hint && !NON_CHAT_RE.test(d.hint) && !healedModels.has(`${d.provider}:${d.hint}`) && await probeModel({ provider: d.provider, model: d.hint })) chosen = d.hint;
+    if (!chosen && fam !== "other") {
       if (!catalogs.has(d.provider)) catalogs.set(d.provider, await fetchModelCatalog(d.provider));
       const cands = catalogs.get(d.provider)
         .filter((id) => !NON_CHAT_RE.test(id) && modelFamily(id) === fam && !healedModels.has(`${d.provider}:${id}`))
@@ -2755,8 +2791,8 @@ async function healDeadModels(dead) {
   }
   return report;
 }
-function queueModelHeal(pc) {
-  healDeadModels([{ provider: pc.provider, model: pc.model }])
+function queueModelHeal(pc, err = null) {
+  healDeadModels([{ provider: pc.provider, model: pc.model, hint: modelHintFromError(err?.message) }])
     .then((rep) => { if (rep.length) logger.warn({ report: rep }, "auto-réparation des modèles"); })
     .catch((e) => logger.warn({ err: e.message }, "auto-réparation des modèles impossible"));
 }
@@ -6162,7 +6198,7 @@ async function bootstrap({ listen = true } = {}) {
   if (!CONFIG.FAKE_LLM && envBool("STARTUP_LLM_CHECK", CONFIG.ENV !== "test")) {     // verdict immédiat dans les logs : quel modèle répond, lequel échoue et pourquoi
     setTimeout(() => diagnoseProviders().then(async (r) => {
       try {   // [FIX] les modèles en 404 détectés au démarrage sont écartés et remplacés AVANT le premier message utilisateur
-        const dead = r.filter((x) => !x.ok && x.kind === "model").map((x) => ({ provider: x.provider, model: x.model }));
+        const dead = r.filter((x) => !x.ok && x.kind === "model").map((x) => ({ provider: x.provider, model: x.model, hint: modelHintFromError(x.message) }));
         if (dead.length) logger.warn({ report: await healDeadModels(dead) }, "auto-réparation des modèles (démarrage)");
       } catch (e) { logger.warn({ err: e.message }, "auto-réparation au démarrage impossible"); }
       // [FIX audit] Ne jamais détacher une méthode du logger (choisir logger.info ou logger.error dans un ternaire puis l'appeler) :
@@ -6495,7 +6531,7 @@ const CONFIG = Object.freeze({
   // ─── Vision ───
   VISION: Object.freeze({
     GROQ_MODEL:       process.env.VISION_MODEL_GROQ       || "meta-llama/llama-4-maverick-17b-128e-instruct",
-    GEMINI_MODEL:     process.env.VISION_MODEL_GEMINI     || "gemini-2.5-flash",
+    GEMINI_MODEL:     process.env.VISION_MODEL_GEMINI     || "gemini-3.8-flash",
     OPENROUTER_MODEL: process.env.VISION_MODEL_OPENROUTER || "qwen/qwen-2.5-vl-72b-instruct:free"
   }),
 
@@ -8435,7 +8471,7 @@ const MODEL_TIERS = Object.freeze({
       },
       {
         provider: "gemini",
-        model: process.env.GEMINI_MODEL_V100 || "gemini-2.5-flash",
+        model: process.env.GEMINI_MODEL_V100 || "gemini-3.8-flash",
         maxTokens: 8000, timeout: 22000, temperature: 0.7, failoverPriority: 1
       },
       {
@@ -8477,7 +8513,7 @@ const MODEL_TIERS = Object.freeze({
         },
         {
           provider: "gemini",
-          model: process.env.GEMINI_MODEL_V250_REASONING || "gemini-2.5-flash",
+          model: process.env.GEMINI_MODEL_V250_REASONING || "gemini-3.8-flash",
           maxTokens: 8000, timeout: 35000, temperature: 0.3, failoverPriority: 2
         }
       ]
@@ -9746,7 +9782,7 @@ function earsFail(kind, msg) {
 }
 function earsStatus() {
   const t = Date.now();
-  return { configured: Boolean(earsKey()), model: process.env.GEMINI_EARS_MODEL || "gemini-2.5-flash", breaker: !earsKey() ? "off" : earsState.openUntil > t ? "open" : earsState.openUntil ? "half-open" : "closed", ok: earsState.ok, failed: earsState.ko, lastError: earsState.lastError };
+  return { configured: Boolean(earsKey()), model: process.env.GEMINI_EARS_MODEL || "gemini-3.8-flash", breaker: !earsKey() ? "off" : earsState.openUntil > t ? "open" : earsState.openUntil ? "half-open" : "closed", ok: earsState.ok, failed: earsState.ko, lastError: earsState.lastError };
 }
 
 async function transcribeAudioGemini(buffer, mimetype) {
@@ -9756,7 +9792,7 @@ async function transcribeAudioGemini(buffer, mimetype) {
   if ((earsBadMime.get(mime) || 0) > t0 || buffer.length > 14 * 1024 * 1024) return { success: false, skipped: true };
   if (earsState.openUntil > t0) return { success: false, skipped: true };
   if (earsState.openUntil) { if (earsState.probing) return { success: false, skipped: true }; earsState.probing = true; }
-  const model = process.env.GEMINI_EARS_MODEL || "gemini-2.5-flash";
+  const model = process.env.GEMINI_EARS_MODEL || "gemini-3.8-flash";
   const generationConfig = { temperature: 0 };
   if (/gemini-2\.5-flash(?!-lite)/.test(model)) generationConfig.thinkingConfig = { thinkingBudget: 0 };   // transcription : pas de « réflexion », plus rapide
   try {
