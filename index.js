@@ -2092,7 +2092,7 @@ function sanitizeGeminiSchema(sc) {
   return out;
 }
 
-function toGeminiPayload(messages, images, tools, { maxTokens, temperature, model }) {
+function toGeminiPayload(messages, images, tools, { maxTokens, temperature, model, reasoningEffort }) {
   const sys = [];
   const contents = [];
   for (const m of messages) {
@@ -2128,6 +2128,12 @@ function toGeminiPayload(messages, images, tools, { maxTokens, temperature, mode
   }
   const body = { contents, generationConfig: { temperature, maxOutputTokens: maxTokens || 8000 } };
   if (/gemini-(2\.5|3)/.test(model || "")) body.generationConfig.thinkingConfig = { includeThoughts: true };   // refusé (400) par les anciens modèles
+  // [FIX « réf : gemini2 empty »] Les Gemini 3.x « pensent » par défaut en niveau élevé : la réflexion consommait tout maxOutputTokens et le texte
+  // visible restait vide. Niveau « low » par défaut (tier rapide) ; « high » seulement si demandé explicitement.
+  if (/gemini-3/.test(model || "")) {
+    body.generationConfig.thinkingConfig.thinkingLevel = reasoningEffort === "high" ? "high" : "low";
+    body.generationConfig.maxOutputTokens = Math.max(maxTokens || 8000, 1024);
+  }
   if (sys.length) body.systemInstruction = { parts: [{ text: sys.join("\n\n") }] };
   if (tools?.length) {
     body.tools = [{ functionDeclarations: tools.map((t) => {
@@ -2548,7 +2554,7 @@ async function callLLM({ chain, messages, tools, images, lane, signal, deadlineA
           health.release(pc);
           continue;
         }
-        if (err.kind === "empty" && effort && effort !== "low" && !effortRetry) {   // tout le budget a été « pensé » : effort réduit
+        if (err.kind === "empty" && effort !== "low" && !effortRetry) {   // tout le budget a été « pensé » : effort réduit
           effortRetry = true; effort = "low";
           health.release(pc);
           continue;
