@@ -1,6 +1,6 @@
 --- orig/index.js	2026-11-25 17:43:57.876801349 +0000
-+++ index.js	2026-11-26 12:27:16.104985838 +0000
-@@ -1812,35 +1812,35 @@
++++ index.js	2026-11-26 12:49:24.457929210 +0000
+@@ -1812,39 +1812,47 @@
      lane: "light",
      chain: [
        mk("groq", envStr("GROQ_MODEL_V100", "openai/gpt-oss-120b")),
@@ -46,7 +46,19 @@
      ]
    }
  };
-@@ -2092,7 +2092,7 @@
+ 
++// [FIX « réf : rate_limit » en v250] La chaîne v250 ne comptait que 2-4 modèles (Groq, Gemini Pro preview au quota gratuit minime…) : un 429 sur
++// chacun et la requête échouait. Les modèles du tier v100 sont ajoutés EN FIN de chaîne (jamais devant) : dégradation gracieuse au lieu d'une erreur.
++for (const heavyChain of [TIERS.v250.chain, TIERS.v250.code]) {
++  for (const pc of TIERS.v100.chain) {
++    if (!heavyChain.some((x) => x.provider === pc.provider && x.model === pc.model)) heavyChain.push({ ...pc });
++  }
++}
++
+ function tierChain(tier, { hasImages = false, code = false } = {}) {
+   if (CONFIG.FAKE_LLM) return [{ provider: "fake", model: "fake-1", maxTokens: 2000, temperature: 0.7 }];
+   const base = hasImages ? TIERS.vision.chain : (tier === "v250" ? (code ? TIERS.v250.code : TIERS.v250.chain) : TIERS.v100.chain);
+@@ -2092,7 +2100,7 @@
    return out;
  }
  
@@ -55,7 +67,7 @@
    const sys = [];
    const contents = [];
    for (const m of messages) {
-@@ -2128,6 +2128,12 @@
+@@ -2128,6 +2136,12 @@
    }
    const body = { contents, generationConfig: { temperature, maxOutputTokens: maxTokens || 8000 } };
    if (/gemini-(2\.5|3)/.test(model || "")) body.generationConfig.thinkingConfig = { includeThoughts: true };   // refusé (400) par les anciens modèles
@@ -68,7 +80,7 @@
    if (sys.length) body.systemInstruction = { parts: [{ text: sys.join("\n\n") }] };
    if (tools?.length) {
      body.tools = [{ functionDeclarations: tools.map((t) => {
-@@ -2297,9 +2303,21 @@
+@@ -2297,9 +2311,21 @@
  }
  
  /** Garde le prompt sous le budget : système + dernier message toujours conservés, historique rogné par l'ancien. */
@@ -92,7 +104,7 @@
    const rest = messages.filter((m) => m.role !== "system");
    if (!rest.length) return { messages, dropped: 0 };
    const last = rest[rest.length - 1];
-@@ -2322,7 +2340,8 @@
+@@ -2322,7 +2348,8 @@
    timeout_first: "La réflexion a pris trop de temps. Réessaie, ou pose la question en plus court.",
    timeout_idle: "La connexion au modèle s'est interrompue. Réessaie dans un instant.",
    timeout_total: "La réponse a pris trop de temps. Réessaie avec une question plus ciblée.",
@@ -102,7 +114,15 @@
    auth: "Luba est momentanément indisponible (accès au modèle en cours de vérification). Réessaie un peu plus tard.",
    model: "Luba est momentanément indisponible (modèle en cours de mise à jour). Réessaie un peu plus tard.",
    network: "Luba n'arrive pas à joindre ses modèles pour le moment. Réessaie dans un instant.",
-@@ -2392,7 +2411,7 @@
+@@ -2383,6 +2410,7 @@
+ 
+   let committed = "";
+   let lastErr = null;
++  let fastRefunds = 0;
+ 
+   providers: for (const pc of order) {
+     const cfg = PROVIDERS[pc.provider];
+@@ -2392,7 +2420,7 @@
        : lane === "heavy" ? envInt("HEAVY_MAX_OUTPUT_TOKENS", 6500)
        : envInt("LIGHT_MAX_OUTPUT_TOKENS", 1600);
      let pcx = { ...pc, maxTokens: Math.min(pc.maxTokens, outputCeiling, learned?.maxTokens || Infinity) };
@@ -111,7 +131,7 @@
      let toolsHere = learned?.noTools ? null : tools;
      let effort = pc.reasoningEffort;
      let attempt = 0, shrinks = 0, noToolRetry = false, effortRetry = false, guard = 0;
-@@ -2426,7 +2445,7 @@
+@@ -2426,7 +2454,7 @@
          },
          onReasoning: (t) => { if (ttft === null) ttft = now() - startedAt; emit.reasoning(t); }
        };
@@ -120,7 +140,7 @@
          ? [...workHere, { role: "assistant", content: committed }, { role: "user", content: CONTINUE_PROMPT }]
          : workHere;
  
-@@ -2435,14 +2454,29 @@
+@@ -2435,14 +2463,29 @@
          const gate = operationBudgetLib.tryConsumeGeneration(operationBudget, now(), deadlineAt);
          if (!gate.ok) {
            wd.stop(); health.release(pc);
@@ -152,7 +172,7 @@
          if (!tokenGate.ok) {
            wd.stop(); health.release(pc);
            lastErr = new ProviderError("context", tokenGate.message || "Budget de tokens de cette opération atteint");
-@@ -2494,7 +2528,7 @@
+@@ -2494,7 +2537,7 @@
            attemptsUsed = Math.max(0, attemptsUsed - 1);
            health.ban(pc, CONFIG.HEALTH.MODEL_BAN_MS);
            logger.error({ provider: pc.provider, model: pc.model, status: err.status }, "modèle introuvable/retiré (404) → écarté ; changer la variable d'environnement du modèle ou laisser l'auto-réparation le remplacer");
@@ -161,7 +181,7 @@
            break;
          }
  
-@@ -2508,7 +2542,7 @@
+@@ -2508,7 +2551,7 @@
            const targetTotal = lim.limit && lim.requested ? Math.floor(inTok * clamp(lim.limit / lim.requested, 0.2, 0.9) * 0.85) : Math.floor(inTok / 2);
            if (shrinks >= 2 || (lim.limit && lim.limit < 6000)) toolsHere = null;
            const msgBudget = Math.max(1200, targetTotal - (toolsHere ? tTok : 0));
@@ -170,7 +190,7 @@
            const room = lim.limit ? lim.limit - msgBudget - (toolsHere ? tTok : 0) - 300 : Math.floor(pcx.maxTokens / 2);
            pcx = { ...pcx, maxTokens: clamp(room, 512, pcx.maxTokens) };
            learnLimits(pc, { maxTokens: pcx.maxTokens, ctx: msgBudget, noTools: toolsHere === null && Boolean(tools?.length) });
-@@ -2520,7 +2554,7 @@
+@@ -2520,12 +2563,17 @@
            health.release(pc);
            continue;
          }
@@ -179,7 +199,17 @@
            effortRetry = true; effort = "low";
            health.release(pc);
            continue;
-@@ -2678,7 +2712,7 @@
+         }
+ 
++        // [FIX] Un 429 / refus d'authentification instantané (aucun texte émis) ne doit pas brûler le budget de tentatives : comme pour le 404,
++        // on passe au fournisseur suivant (plafonné à 4 remboursements ; le budget d'opération et le délai global restent appliqués).
++        if ((err.kind === "rate_limit" || err.kind === "auth") && !visible && !committed && fastRefunds < 4 && !(err.kind === "rate_limit" && pool.pick())) {
++          fastRefunds++; attemptsUsed = Math.max(0, attemptsUsed - 1);
++        }
+         health.record(pc, err.kind);
+         if (err.kind === "rate_limit") pool.cool(key.label, err.retryAfterMs ?? CONFIG.HEALTH.KEY_COOLDOWN_MS);
+         if (err.kind === "auth") pool.cool(key.label, CONFIG.HEALTH.KEY_AUTH_COOLDOWN_MS);
+@@ -2678,7 +2726,7 @@
        return { ...base, ok: true, latencyMs: now() - t0, sample: text.replace(/\s+/g, " ").trim().slice(0, 30) };
      } catch (e) {
        const err = e instanceof ProviderError ? e : new ProviderError(wd.signal.aborted ? (wd.reason || "timeout_total") : "network", String(e.message || e));
@@ -188,7 +218,7 @@
      } finally { wd.stop(); }
    }));
  }
-@@ -2723,10 +2757,17 @@
+@@ -2723,10 +2771,17 @@
      const streamer = cfg.kind === "gemini" ? streamGemini : streamOpenAI;
      await streamer({ pc: { ...pc, maxTokens: 24, temperature: 0 }, cfg, key, messages: [{ role: "user", content: "Réponds uniquement : OK" }], tools: null, images: null, wd, h });
      return true;
@@ -207,7 +237,7 @@
  async function healDeadModels(dead) {
    if (!MODEL_AUTOHEAL || CONFIG.FAKE_LLM) return [];
    const allPcs = [...TIERS.v100.chain, ...TIERS.v250.chain, ...TIERS.v250.code, ...TIERS.vision.chain];
-@@ -2738,7 +2779,8 @@
+@@ -2738,7 +2793,8 @@
      for (const pc of allPcs) if (pc.provider === d.provider && pc.model === d.model) health.ban(pc, CONFIG.HEALTH.MODEL_BAN_MS);
      const fam = modelFamily(d.model);
      let chosen = null;
@@ -217,7 +247,7 @@
        if (!catalogs.has(d.provider)) catalogs.set(d.provider, await fetchModelCatalog(d.provider));
        const cands = catalogs.get(d.provider)
          .filter((id) => !NON_CHAT_RE.test(id) && modelFamily(id) === fam && !healedModels.has(`${d.provider}:${id}`))
-@@ -2755,8 +2797,8 @@
+@@ -2755,8 +2811,8 @@
    }
    return report;
  }
@@ -228,7 +258,7 @@
      .then((rep) => { if (rep.length) logger.warn({ report: rep }, "auto-réparation des modèles"); })
      .catch((e) => logger.warn({ err: e.message }, "auto-réparation des modèles impossible"));
  }
-@@ -6162,7 +6204,7 @@
+@@ -6162,7 +6218,7 @@
    if (!CONFIG.FAKE_LLM && envBool("STARTUP_LLM_CHECK", CONFIG.ENV !== "test")) {     // verdict immédiat dans les logs : quel modèle répond, lequel échoue et pourquoi
      setTimeout(() => diagnoseProviders().then(async (r) => {
        try {   // [FIX] les modèles en 404 détectés au démarrage sont écartés et remplacés AVANT le premier message utilisateur
@@ -237,7 +267,7 @@
          if (dead.length) logger.warn({ report: await healDeadModels(dead) }, "auto-réparation des modèles (démarrage)");
        } catch (e) { logger.warn({ err: e.message }, "auto-réparation au démarrage impossible"); }
        // [FIX audit] Ne jamais détacher une méthode du logger (choisir logger.info ou logger.error dans un ternaire puis l'appeler) :
-@@ -6495,7 +6537,7 @@
+@@ -6495,7 +6551,7 @@
    // ─── Vision ───
    VISION: Object.freeze({
      GROQ_MODEL:       process.env.VISION_MODEL_GROQ       || "meta-llama/llama-4-maverick-17b-128e-instruct",
@@ -246,7 +276,7 @@
      OPENROUTER_MODEL: process.env.VISION_MODEL_OPENROUTER || "qwen/qwen-2.5-vl-72b-instruct:free"
    }),
  
-@@ -8435,7 +8477,7 @@
+@@ -8435,7 +8491,7 @@
        },
        {
          provider: "gemini",
@@ -255,7 +285,7 @@
          maxTokens: 8000, timeout: 22000, temperature: 0.7, failoverPriority: 1
        },
        {
-@@ -8477,7 +8519,7 @@
+@@ -8477,7 +8533,7 @@
          },
          {
            provider: "gemini",
@@ -264,7 +294,7 @@
            maxTokens: 8000, timeout: 35000, temperature: 0.3, failoverPriority: 2
          }
        ]
-@@ -9746,7 +9788,7 @@
+@@ -9746,7 +9802,7 @@
  }
  function earsStatus() {
    const t = Date.now();
@@ -273,7 +303,7 @@
  }
  
  async function transcribeAudioGemini(buffer, mimetype) {
-@@ -9756,7 +9798,7 @@
+@@ -9756,7 +9812,7 @@
    if ((earsBadMime.get(mime) || 0) > t0 || buffer.length > 14 * 1024 * 1024) return { success: false, skipped: true };
    if (earsState.openUntil > t0) return { success: false, skipped: true };
    if (earsState.openUntil) { if (earsState.probing) return { success: false, skipped: true }; earsState.probing = true; }

@@ -1845,6 +1845,14 @@ const TIERS = {
   }
 };
 
+// [FIX « réf : rate_limit » en v250] La chaîne v250 ne comptait que 2-4 modèles (Groq, Gemini Pro preview au quota gratuit minime…) : un 429 sur
+// chacun et la requête échouait. Les modèles du tier v100 sont ajoutés EN FIN de chaîne (jamais devant) : dégradation gracieuse au lieu d'une erreur.
+for (const heavyChain of [TIERS.v250.chain, TIERS.v250.code]) {
+  for (const pc of TIERS.v100.chain) {
+    if (!heavyChain.some((x) => x.provider === pc.provider && x.model === pc.model)) heavyChain.push({ ...pc });
+  }
+}
+
 function tierChain(tier, { hasImages = false, code = false } = {}) {
   if (CONFIG.FAKE_LLM) return [{ provider: "fake", model: "fake-1", maxTokens: 2000, temperature: 0.7 }];
   const base = hasImages ? TIERS.vision.chain : (tier === "v250" ? (code ? TIERS.v250.code : TIERS.v250.chain) : TIERS.v100.chain);
@@ -2402,6 +2410,7 @@ async function callLLM({ chain, messages, tools, images, lane, signal, deadlineA
 
   let committed = "";
   let lastErr = null;
+  let fastRefunds = 0;
 
   providers: for (const pc of order) {
     const cfg = PROVIDERS[pc.provider];
@@ -2560,6 +2569,11 @@ async function callLLM({ chain, messages, tools, images, lane, signal, deadlineA
           continue;
         }
 
+        // [FIX] Un 429 / refus d'authentification instantané (aucun texte émis) ne doit pas brûler le budget de tentatives : comme pour le 404,
+        // on passe au fournisseur suivant (plafonné à 4 remboursements ; le budget d'opération et le délai global restent appliqués).
+        if ((err.kind === "rate_limit" || err.kind === "auth") && !visible && !committed && fastRefunds < 4 && !(err.kind === "rate_limit" && pool.pick())) {
+          fastRefunds++; attemptsUsed = Math.max(0, attemptsUsed - 1);
+        }
         health.record(pc, err.kind);
         if (err.kind === "rate_limit") pool.cool(key.label, err.retryAfterMs ?? CONFIG.HEALTH.KEY_COOLDOWN_MS);
         if (err.kind === "auth") pool.cool(key.label, CONFIG.HEALTH.KEY_AUTH_COOLDOWN_MS);
